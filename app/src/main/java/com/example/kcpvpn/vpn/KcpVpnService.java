@@ -1,0 +1,485 @@
+package com.example.kcpvpn.vpn;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+
+import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+
+import com.example.kcpvpn.R;
+import com.example.kcpvpn.log.LogConfig;
+import com.example.kcpvpn.log.Logger;
+import com.example.kcpvpn.ui.MainActivity;
+
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+
+/**
+ * KCP VPN 服务 - Android VpnService 实现
+ * 全局流量捕获并转发到 KCP 隧道
+ */
+public class KcpVpnService extends VpnService {
+
+    private ParcelFileDescriptor vpnInterface;
+    private FileInputStream vpnInputStream;
+    private FileOutputStream vpnOutputStream;
+    private FileChannel vpnInputChannel;
+    private FileChannel vpnOutputChannel;
+
+    private TunnelManager tunnelManager;
+    private PacketRouter packetRouter;
+
+    private Thread vpnReadThread;
+
+    private volatile boolean running;
+    private volatile VpnConnectionState connectionState;
+
+    // 配置参数
+    private String serverHost;
+    private int serverPort;
+    private String key;
+    private boolean localMode;
+
+    // 流量统计 — volatile 保证多线程可见性
+    private volatile long uploadBytes;
+    private volatile long downloadBytes;
+
+    // 连接时长
+    private volatile long connectionStartTime;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        // Logger已在Application中初始化
+        Logger.info(LogConfig.MODULE_VPN, "VpnService created");
+
+        running = false;
+        connectionState = VpnConnectionState.DISCONNECTED;
+        uploadBytes = 0;
+        downloadBytes = 0;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        Logger.info(LogConfig.MODULE_VPN, "onStartCommand called");
+
+        if (intent != null) {
+            serverHost = intent.getStringExtra("server_host");
+            serverPort = intent.getIntExtra("server_port", 0);
+            key = intent.getStringExtra("key");
+            localMode = intent.getBooleanExtra("local_mode", false);
+
+            Logger.info(LogConfig.MODULE_VPN, "Parameters: host=" + serverHost
+                    + ", port=" + serverPort + ", localMode=" + localMode);
+        } else {
+            Logger.warning(LogConfig.MODULE_VPN, "onStartCommand intent is null");
+        }
+
+        // 立即启动前台服务（Android 11+ 要求）
+        startForegroundService();
+
+        if (!running) {
+            Logger.info(LogConfig.MODULE_VPN, "Starting VPN...");
+            startVpn();
+        } else {
+            Logger.info(LogConfig.MODULE_VPN, "VPN already running");
+        }
+
+        return START_STICKY;
+    }
+
+    /**
+     * 启动前台服务
+     */
+    private void startForegroundService() {
+        createNotificationChannel();
+
+        Intent notificationIntent = new Intent(this, MainActivity.class);
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this, 0, notificationIntent,
+                PendingIntent.FLAG_IMMUTABLE);
+
+        Notification notification = createNotification(pendingIntent);
+
+        startForeground(VpnConfig.NOTIFICATION_ID, notification);
+        Logger.info(LogConfig.MODULE_VPN, "Foreground service started");
+    }
+
+    /**
+     * 创建通知渠道 — 使用 IMPORTANCE_LOW 避免 VPN 运行时响铃
+     */
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    VpnConfig.NOTIFICATION_CHANNEL_ID,
+                    VpnConfig.NOTIFICATION_CHANNEL_NAME,
+                    NotificationManager.IMPORTANCE_LOW);
+
+            channel.setDescription("KCP VPN 服务状态");
+            channel.setShowBadge(false);
+
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    /**
+     * 创建通知
+     */
+    private Notification createNotification(PendingIntent pendingIntent) {
+        Notification.Builder builder;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder = new Notification.Builder(this, VpnConfig.NOTIFICATION_CHANNEL_ID);
+        } else {
+            builder = new Notification.Builder(this);
+        }
+
+        builder.setSmallIcon(R.drawable.ic_vpn)
+                .setContentTitle("KCP VPN")
+                .setContentText(connectionState.getDisplayText())
+                .setContentIntent(pendingIntent)
+                .setOngoing(true);
+
+        return builder.build();
+    }
+
+    /**
+     * 更新通知
+     */
+    private void updateNotification() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) {
+            Intent notificationIntent = new Intent(this, MainActivity.class);
+            PendingIntent pendingIntent = PendingIntent.getActivity(
+                    this, 0, notificationIntent,
+                    PendingIntent.FLAG_IMMUTABLE);
+
+            String content = connectionState.getDisplayText();
+            if (connectionState == VpnConnectionState.CONNECTED) {
+                long duration = getConnectionDuration();
+                String upload = formatBytes(uploadBytes);
+                String download = formatBytes(downloadBytes);
+                content = "已连接 " + duration + "秒 | ↑" + upload + " ↓" + download;
+            }
+
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder = new Notification.Builder(this, VpnConfig.NOTIFICATION_CHANNEL_ID);
+            } else {
+                builder = new Notification.Builder(this);
+            }
+
+            builder.setSmallIcon(R.drawable.ic_vpn)
+                    .setContentTitle("KCP VPN")
+                    .setContentText(content)
+                    .setContentIntent(pendingIntent)
+                    .setOngoing(true);
+
+            manager.notify(VpnConfig.NOTIFICATION_ID, builder.build());
+        }
+    }
+
+    /**
+     * 启动 VPN
+     */
+    private void startVpn() {
+        Logger.info(LogConfig.MODULE_VPN, "startVpn() begin");
+
+        connectionState = VpnConnectionState.CONNECTING;
+        broadcastState();
+        updateNotification();
+
+        try {
+            Logger.info(LogConfig.MODULE_VPN, "Building VPN interface...");
+
+            // 建立 VPN 接口
+            Builder builder = new Builder();
+            builder.setSession(VpnConfig.VPN_SESSION_NAME)
+                    .setMtu(VpnConfig.VPN_MTU)
+                    .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
+                    .addRoute("0.0.0.0", 0);
+
+            vpnInterface = builder.establish();
+
+            if (vpnInterface == null) {
+                Logger.error(LogConfig.MODULE_VPN, "VPN interface establish failed - vpnInterface is null");
+                connectionState = VpnConnectionState.DISCONNECTED;
+                broadcastState();
+                updateNotification();
+                stopSelf();
+                return;
+            }
+
+            Logger.info(LogConfig.MODULE_VPN, "VPN interface established, fd=" + vpnInterface.getFd());
+
+            // 保持 FileInputStream/FileOutputStream 引用以便正确关闭
+            vpnInputStream = new FileInputStream(vpnInterface.getFileDescriptor());
+            vpnOutputStream = new FileOutputStream(vpnInterface.getFileDescriptor());
+            vpnInputChannel = vpnInputStream.getChannel();
+            vpnOutputChannel = vpnOutputStream.getChannel();
+
+            Logger.info(LogConfig.MODULE_VPN, "VPN channels created");
+
+            // 创建隧道管理器
+            Logger.info(LogConfig.MODULE_VPN, "Creating TunnelManager: " + serverHost + ":" + serverPort);
+            tunnelManager = new TunnelManager(serverHost, serverPort, key);
+            tunnelManager.setStateCallback(state -> {
+                Logger.info(LogConfig.MODULE_VPN, "Tunnel state changed: " + state.getDisplayText());
+                connectionState = state;
+                broadcastState();
+                updateNotification();
+            });
+            tunnelManager.setDataReceivedCallback(data -> {
+                handleInboundData(data);
+            });
+
+            // 创建数据包路由器
+            Logger.info(LogConfig.MODULE_VPN, "Creating PacketRouter");
+            packetRouter = new PacketRouter();
+            packetRouter.start();
+
+            // 连接隧道
+            Logger.info(LogConfig.MODULE_VPN, "Connecting tunnel...");
+            if (!tunnelManager.connect()) {
+                Logger.error(LogConfig.MODULE_VPN, "Tunnel connect failed");
+                closeVpn();
+                connectionState = VpnConnectionState.DISCONNECTED;
+                broadcastState();
+                updateNotification();
+                stopSelf();
+                return;
+            }
+
+            Logger.info(LogConfig.MODULE_VPN, "Tunnel connected successfully");
+
+            // 启动读取线程
+            startVpnReadThread();
+
+            running = true;
+            connectionStartTime = System.currentTimeMillis();
+
+            // 不重复设 CONNECTED，tunnelManager 的回调已经设过了
+            Logger.info(LogConfig.MODULE_VPN, "VPN started successfully");
+
+        } catch (Exception e) {
+            Logger.error(LogConfig.MODULE_VPN, "Start VPN error: " + e.getMessage());
+            closeVpn();
+            connectionState = VpnConnectionState.DISCONNECTED;
+            broadcastState();  // 修复：异常路径也广播状态
+            updateNotification();
+            stopSelf();
+        }
+    }
+
+    /**
+     * 启动 VPN 读取线程
+     */
+    private void startVpnReadThread() {
+        vpnReadThread = new Thread(() -> {
+            ByteBuffer buffer = ByteBuffer.allocate(VpnConfig.VPN_MTU + 28);
+
+            while (running && vpnInputChannel != null) {
+                try {
+                    buffer.clear();
+                    int len = vpnInputChannel.read(buffer);
+
+                    if (len > 0) {
+                        buffer.flip();
+                        byte[] packet = new byte[len];
+                        buffer.get(packet);
+
+                        // 处理出站数据包
+                        packetRouter.handleOutboundPacket(packet,
+                                new PacketRouter.SendDataCallback() {
+                                    @Override
+                                    public void onSendData(byte[] data) {
+                                        tunnelManager.sendData(data);
+                                        uploadBytes += data.length;
+                                    }
+                                });
+
+                        Logger.debug(LogConfig.MODULE_VPN, "VPN read: " + len + " bytes");
+                    }
+
+                } catch (IOException e) {
+                    if (running) {
+                        Logger.error(LogConfig.MODULE_VPN, "VPN read error: " + e.getMessage());
+                    }
+                    break;
+                }
+            }
+        }, "VPN-Read");
+        vpnReadThread.start();
+    }
+
+    /**
+     * 处理入站数据
+     */
+    private void handleInboundData(byte[] data) {
+        if (!running || vpnOutputChannel == null) {
+            return;
+        }
+
+        packetRouter.handleInboundData(data,
+                new PacketRouter.WritePacketCallback() {
+                    @Override
+                    public void onWritePacket(byte[] packet) {
+                        try {
+                            ByteBuffer buffer = ByteBuffer.wrap(packet);
+                            vpnOutputChannel.write(buffer);
+                            downloadBytes += packet.length;
+
+                            Logger.debug(LogConfig.MODULE_VPN, "VPN write: " + packet.length + " bytes");
+                        } catch (IOException e) {
+                            Logger.error(LogConfig.MODULE_VPN, "VPN write error: " + e.getMessage());
+                        }
+                    }
+                });
+    }
+
+    /**
+     * 关闭 VPN
+     */
+    private void closeVpn() {
+        running = false;
+
+        Logger.info(LogConfig.MODULE_VPN, "Closing VPN...");
+
+        // 停止隧道
+        if (tunnelManager != null) {
+            tunnelManager.disconnect();
+            tunnelManager = null;
+        }
+
+        // 停止路由器
+        if (packetRouter != null) {
+            packetRouter.stop();
+            packetRouter = null;
+        }
+
+        // 停止读取线程
+        if (vpnReadThread != null) {
+            vpnReadThread.interrupt();
+            vpnReadThread = null;
+        }
+
+        // 关闭 VPN 接口（关闭 stream 会同时关闭 channel）
+        try {
+            if (vpnInputStream != null) {
+                vpnInputStream.close();
+                vpnInputStream = null;
+                vpnInputChannel = null;
+            }
+            if (vpnOutputStream != null) {
+                vpnOutputStream.close();
+                vpnOutputStream = null;
+                vpnOutputChannel = null;
+            }
+            if (vpnInterface != null) {
+                vpnInterface.close();
+                vpnInterface = null;
+            }
+        } catch (IOException e) {
+            Logger.error(LogConfig.MODULE_VPN, "Close VPN interface error: " + e.getMessage());
+        }
+
+        Logger.info(LogConfig.MODULE_VPN, "VPN closed");
+    }
+
+    @Override
+    public void onDestroy() {
+        closeVpn();
+        super.onDestroy();
+    }
+
+    @Override
+    public void onRevoke() {
+        Logger.warning(LogConfig.MODULE_VPN, "VPN authorization revoked");
+        closeVpn();
+        connectionState = VpnConnectionState.DISCONNECTED;
+        broadcastState();
+        updateNotification();
+        stopSelf();
+    }
+
+    /**
+     * 停止 VPN（供外部调用）
+     */
+    public void stopVpn() {
+        closeVpn();
+        connectionState = VpnConnectionState.DISCONNECTED;
+        broadcastState();
+        updateNotification();
+        stopSelf();
+    }
+
+    /**
+     * 获取连接状态
+     */
+    public VpnConnectionState getConnectionState() {
+        return connectionState;
+    }
+
+    /**
+     * 获取连接时长（秒）
+     */
+    public long getConnectionDuration() {
+        if (!running) {
+            return 0;
+        }
+        return (System.currentTimeMillis() - connectionStartTime) / 1000;
+    }
+
+    /**
+     * 获取上传流量
+     */
+    public long getUploadBytes() {
+        return uploadBytes;
+    }
+
+    /**
+     * 获取下载流量
+     */
+    public long getDownloadBytes() {
+        return downloadBytes;
+    }
+
+    /**
+     * 格式化字节
+     */
+    private String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + "B";
+        } else if (bytes < 1024 * 1024) {
+            return (bytes / 1024) + "KB";
+        } else {
+            return (bytes / (1024 * 1024)) + "MB";
+        }
+    }
+
+    /**
+     * 广播状态变化
+     */
+    private void broadcastState() {
+        Logger.info(LogConfig.MODULE_VPN, "Broadcasting state: " + connectionState.getDisplayText());
+
+        Intent intent = new Intent(VpnStateBroadcast.ACTION_STATE_CHANGED);
+        intent.putExtra(VpnStateBroadcast.EXTRA_STATE, connectionState.name());
+        intent.putExtra(VpnStateBroadcast.EXTRA_UPLOAD_BYTES, uploadBytes);
+        intent.putExtra(VpnStateBroadcast.EXTRA_DOWNLOAD_BYTES, downloadBytes);
+        intent.putExtra(VpnStateBroadcast.EXTRA_DURATION, getConnectionDuration());
+
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+    }
+}

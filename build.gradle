@@ -1,0 +1,9 @@
+buildscript {
+    ext {
+        agp_version = '8.13.2'
+        agp_version1 = '8.13.2'
+    }
+}
+plugins {
+    id 'com.android.application' version '8.13.2' apply false
+}

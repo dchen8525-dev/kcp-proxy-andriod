@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KCP VPN</string>
+    <string name="title_main">主界面</string>
+    <string name="title_log">日志</string>
+    <string name="mode_remote">外网模式</string>
+    <string name="mode_local">本地自测</string>
+    <string name="server_ip">服务器 IP</string>
+    <string name="server_port">服务器端口</string>
+    <string name="key">密钥</string>
+    <string name="connect">连接</string>
+    <string name="disconnect">断开</string>
+    <string name="start_local">启动本地服务</string>
+    <string name="stop_local">停止本地服务</string>
+    <string name="clear_log">清空日志</string>
+    <string name="log_level">日志级别</string>
+    <string name="state_disconnected">未连接</string>
+    <string name="state_connecting">连接中...</string>
+    <string name="state_connected">已连接</string>
+    <string name="state_reconnecting">重连中...</string>
+    <string name="state_disconnecting">断开中...</string>
+    <string name="duration">时长</string>
+    <string name="upload">上传</string>
+    <string name="download">下载</string>
+</resources>
