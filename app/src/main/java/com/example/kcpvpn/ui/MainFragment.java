@@ -59,6 +59,10 @@ public class MainFragment extends Fragment {
 
     // VPN 授权请求码
     private static final int VPN_AUTH_REQUEST_CODE = 1001;
+    private static final String STATE_WAITING_VPN_AUTH = "waiting_vpn_auth";
+    private static final String STATE_SERVER_IP = "server_ip";
+    private static final String STATE_SERVER_PORT = "server_port";
+    private static final String STATE_KEY = "key";
     private boolean waitingVpnAuth = false;
 
     public MainFragment() {
@@ -81,6 +85,54 @@ public class MainFragment extends Fragment {
         initViews(view);
         setupListeners();
         setupObservers();
+
+        // 恢复模式选择
+        MainViewModel.Mode savedMode = viewModel.getMode();
+        if (savedMode == MainViewModel.Mode.LOCAL) {
+            modeToggleGroup.check(R.id.btn_local_mode);
+        } else {
+            modeToggleGroup.check(R.id.btn_remote_mode);
+        }
+    }
+
+    @Override
+    public void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putBoolean(STATE_WAITING_VPN_AUTH, waitingVpnAuth);
+        // 保存输入框内容
+        if (etServerIp != null) {
+            outState.putString(STATE_SERVER_IP, etServerIp.getText() != null
+                    ? etServerIp.getText().toString() : "");
+        }
+        if (etServerPort != null) {
+            outState.putString(STATE_SERVER_PORT, etServerPort.getText() != null
+                    ? etServerPort.getText().toString() : "");
+        }
+        if (etKey != null) {
+            outState.putString(STATE_KEY, etKey.getText() != null
+                    ? etKey.getText().toString() : "");
+        }
+    }
+
+    @Override
+    public void onViewStateRestored(Bundle savedInstanceState) {
+        super.onViewStateRestored(savedInstanceState);
+        if (savedInstanceState != null) {
+            waitingVpnAuth = savedInstanceState.getBoolean(STATE_WAITING_VPN_AUTH, false);
+            // 恢复输入框内容
+            String ip = savedInstanceState.getString(STATE_SERVER_IP);
+            String port = savedInstanceState.getString(STATE_SERVER_PORT);
+            String key = savedInstanceState.getString(STATE_KEY);
+            if (ip != null && etServerIp != null) {
+                etServerIp.setText(ip);
+            }
+            if (port != null && etServerPort != null) {
+                etServerPort.setText(port);
+            }
+            if (key != null && etKey != null) {
+                etKey.setText(key);
+            }
+        }
     }
 
     /**
@@ -152,7 +204,7 @@ public class MainFragment extends Fragment {
 
             // 检查网络
             if (!NetworkUtil.isNetworkAvailable(requireContext())) {
-                Snackbar.make(v, "网络不可用", Snackbar.LENGTH_SHORT).show();
+                showSnackbar("网络不可用");
                 return;
             }
 
@@ -214,11 +266,13 @@ public class MainFragment extends Fragment {
             tvLocalPort.setText(running ? viewModel.getLocalServerPort() : "未启动");
         });
 
-        // 错误消息
-        viewModel.getErrorMessage().observe(getViewLifecycleOwner(), message -> {
-            if (message != null && !message.isEmpty()) {
-                Snackbar.make(requireView(), message, Snackbar.LENGTH_LONG).show();
-                viewModel.clearErrorMessage();
+        // 错误消息（一次性事件，防止配置变化时重复弹出）
+        viewModel.getErrorMessage().observe(getViewLifecycleOwner(), event -> {
+            if (event != null) {
+                String message = event.getContentIfNotHandled();
+                if (message != null && !message.isEmpty()) {
+                    showSnackbarLong(message);
+                }
             }
         });
     }
@@ -236,7 +290,7 @@ public class MainFragment extends Fragment {
             String key = etKey.getText() != null ? etKey.getText().toString().trim() : "";
 
             if (host.isEmpty() || portStr.isEmpty() || key.isEmpty()) {
-                Snackbar.make(requireView(), "请填写完整配置", Snackbar.LENGTH_SHORT).show();
+                showSnackbar("请填写完整配置");
                 return;
             }
 
@@ -244,12 +298,12 @@ public class MainFragment extends Fragment {
             try {
                 port = Integer.parseInt(portStr);
             } catch (NumberFormatException e) {
-                Snackbar.make(requireView(), "端口格式错误，请输入数字", Snackbar.LENGTH_SHORT).show();
+                showSnackbar("端口格式错误，请输入数字");
                 return;
             }
 
             if (port < 1 || port > 65535) {
-                Snackbar.make(requireView(), "端口范围应为 1-65535", Snackbar.LENGTH_SHORT).show();
+                showSnackbar("端口范围应为 1-65535");
                 return;
             }
 
@@ -258,7 +312,7 @@ public class MainFragment extends Fragment {
         } else if (mode == MainViewModel.Mode.LOCAL) {
             // 本地模式
             if (!viewModel.isLocalServerRunning()) {
-                Snackbar.make(requireView(), "请先启动本地服务", Snackbar.LENGTH_SHORT).show();
+                showSnackbar("请先启动本地服务");
                 return;
             }
 
@@ -277,7 +331,10 @@ public class MainFragment extends Fragment {
                 startConnection();
             } else {
                 Logger.warning(LogConfig.MODULE_UI, "VPN authorization denied");
-                Snackbar.make(requireView(), "VPN 授权被拒绝", Snackbar.LENGTH_SHORT).show();
+                View view = getView();
+                if (view != null && isAdded()) {
+                    Snackbar.make(view, "VPN 授权被拒绝", Snackbar.LENGTH_SHORT).show();
+                }
             }
         }
     }
@@ -309,6 +366,26 @@ public class MainFragment extends Fragment {
             return String.format("%.1f MB", bytes / (1024.0 * 1024));
         } else {
             return String.format("%.1f GB", bytes / (1024.0 * 1024 * 1024));
+        }
+    }
+
+    /**
+     * 安全地显示 Snackbar，避免 View 已销毁时崩溃
+     */
+    private void showSnackbar(String message) {
+        View view = getView();
+        if (view != null && isAdded()) {
+            Snackbar.make(view, message, Snackbar.LENGTH_SHORT).show();
+        }
+    }
+
+    /**
+     * 安全地显示长时 Snackbar
+     */
+    private void showSnackbarLong(String message) {
+        View view = getView();
+        if (view != null && isAdded()) {
+            Snackbar.make(view, message, Snackbar.LENGTH_LONG).show();
         }
     }
 }

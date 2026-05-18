@@ -4,7 +4,9 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
@@ -48,6 +50,12 @@ public class KcpVpnService extends VpnService {
     private String key;
     private boolean localMode;
 
+    private static final String PREFS_NAME = "kcp_vpn_prefs";
+    private static final String KEY_SERVER_HOST = "server_host";
+    private static final String KEY_SERVER_PORT = "server_port";
+    private static final String KEY_KEY = "key";
+    private static final String KEY_LOCAL_MODE = "local_mode";
+
     // 流量统计 — volatile 保证多线程可见性
     private volatile long uploadBytes;
     private volatile long downloadBytes;
@@ -65,6 +73,9 @@ public class KcpVpnService extends VpnService {
         connectionState = VpnConnectionState.DISCONNECTED;
         uploadBytes = 0;
         downloadBytes = 0;
+
+        // 恢复上次保存的参数（进程死亡后重启）
+        restoreParams();
     }
 
     @Override
@@ -77,18 +88,30 @@ public class KcpVpnService extends VpnService {
             key = intent.getStringExtra("key");
             localMode = intent.getBooleanExtra("local_mode", false);
 
+            // 持久化参数，供进程死亡后恢复
+            saveParams();
+
             Logger.info(LogConfig.MODULE_VPN, "Parameters: host=" + serverHost
                     + ", port=" + serverPort + ", localMode=" + localMode);
         } else {
-            Logger.warning(LogConfig.MODULE_VPN, "onStartCommand intent is null");
+            Logger.warning(LogConfig.MODULE_VPN, "onStartCommand intent is null, using saved params");
+            // START_STICKY 重启：使用已保存的参数
+            restoreParams();
+            if (serverHost == null) {
+                Logger.error(LogConfig.MODULE_VPN, "No saved parameters, cannot restart VPN");
+                stopSelf();
+                return START_NOT_STICKY;
+            }
         }
 
         // 立即启动前台服务（Android 11+ 要求）
         startForegroundService();
 
         if (!running) {
-            Logger.info(LogConfig.MODULE_VPN, "Starting VPN...");
-            startVpn();
+            Logger.info(LogConfig.MODULE_VPN, "Starting VPN on background thread...");
+            // 在后台线程执行网络 I/O，避免主线程 ANR
+            Thread startThread = new Thread(this::startVpn, "VPN-Start");
+            startThread.start();
         } else {
             Logger.info(LogConfig.MODULE_VPN, "VPN already running");
         }
@@ -394,6 +417,9 @@ public class KcpVpnService extends VpnService {
             Logger.error(LogConfig.MODULE_VPN, "Close VPN interface error: " + e.getMessage());
         }
 
+        // 清除保存的参数
+        clearSavedParams();
+
         Logger.info(LogConfig.MODULE_VPN, "VPN closed");
     }
 
@@ -466,6 +492,42 @@ public class KcpVpnService extends VpnService {
         } else {
             return (bytes / (1024 * 1024)) + "MB";
         }
+    }
+
+    /**
+     * 保存参数到 SharedPreferences
+     */
+    private void saveParams() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        prefs.edit()
+                .putString(KEY_SERVER_HOST, serverHost)
+                .putInt(KEY_SERVER_PORT, serverPort)
+                .putString(KEY_KEY, key)
+                .putBoolean(KEY_LOCAL_MODE, localMode)
+                .apply();
+    }
+
+    /**
+     * 从 SharedPreferences 恢复参数
+     */
+    private void restoreParams() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        serverHost = prefs.getString(KEY_SERVER_HOST, null);
+        serverPort = prefs.getInt(KEY_SERVER_PORT, 0);
+        key = prefs.getString(KEY_KEY, null);
+        localMode = prefs.getBoolean(KEY_LOCAL_MODE, false);
+    }
+
+    /**
+     * 清除保存的参数
+     */
+    private void clearSavedParams() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        prefs.edit().clear().apply();
+        serverHost = null;
+        serverPort = 0;
+        key = null;
+        localMode = false;
     }
 
     /**

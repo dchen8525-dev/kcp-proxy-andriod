@@ -68,7 +68,8 @@ public class LogFragment extends Fragment {
     @Override
     public void onResume() {
         super.onResume();
-        // 添加日志监听器
+        // 添加日志监听器（先移除再添加，防止 onResume 重复调用导致监听器堆积）
+        removeLogListener();
         createLogListener();
         Logger.getInstance().addListener(logListener);
 
@@ -80,6 +81,13 @@ public class LogFragment extends Fragment {
     public void onPause() {
         super.onPause();
         // 移除日志监听器
+        removeLogListener();
+    }
+
+    /**
+     * 移除日志监听器
+     */
+    private void removeLogListener() {
         if (logListener != null) {
             Logger.getInstance().removeListener(logListener);
         }

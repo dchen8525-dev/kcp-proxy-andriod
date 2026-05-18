@@ -5,6 +5,8 @@ import androidx.lifecycle.LiveData;
 import androidx.lifecycle.MutableLiveData;
 
 import android.app.Application;
+import android.content.Context;
+import android.content.SharedPreferences;
 
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
@@ -14,6 +16,29 @@ import com.example.kcpvpn.util.ServiceUtil;
 import com.example.kcpvpn.vpn.VpnConnectionState;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * 一次性事件包装器，防止配置变化时重复消费
+ */
+public class Event<T> {
+    private final T content;
+    private final AtomicBoolean handled = new AtomicBoolean(false);
+
+    public Event(T content) {
+        this.content = content;
+    }
+
+    public T getContentIfNotHandled() {
+        if (handled.compareAndSet(false, true)) {
+            return content;
+        }
+        return null;
+    }
+
+    public boolean wasHandled() {
+        return handled.get();
+    }
+}
 
 /**
  * 主界面 ViewModel - 状态管理
@@ -31,7 +56,7 @@ public class MainViewModel extends AndroidViewModel {
     private final MutableLiveData<Long> uploadBytes = new MutableLiveData<>(0L);
     private final MutableLiveData<Long> downloadBytes = new MutableLiveData<>(0L);
     private final MutableLiveData<Boolean> localServerRunning = new MutableLiveData<>(false);
-    private final MutableLiveData<String> errorMessage = new MutableLiveData<>();
+    private final MutableLiveData<Event<String>> errorMessage = new MutableLiveData<>();
 
     private LocalKcpServer localServer;
     private int localServerPort;
@@ -39,16 +64,32 @@ public class MainViewModel extends AndroidViewModel {
     private Thread statsUpdateThread;
     private final AtomicBoolean updatingStats = new AtomicBoolean(false);
 
+    private static final String PREFS_NAME = "kcp_vpn_ui_prefs";
+    private static final String KEY_MODE = "mode";
+
     public MainViewModel(Application application) {
         super(application);
         localServerPort = ServerConfig.DEFAULT_PORT;
+
+        // 恢复保存的模式选择
+        SharedPreferences prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String savedMode = prefs.getString(KEY_MODE, Mode.REMOTE.name());
+        mode.setValue(Mode.valueOf(savedMode));
     }
 
     /**
      * 设置模式
      */
     public void setMode(Mode mode) {
+        // 切换到远程模式时，停止本地服务器（防止后台线程泄漏）
+        if (mode == Mode.REMOTE && this.mode.getValue() == Mode.LOCAL) {
+            Logger.info(LogConfig.MODULE_UI, "Switching to REMOTE mode, stopping local server");
+            stopLocalServer();
+        }
         this.mode.setValue(mode);
+        // 持久化模式选择
+        getApplication().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putString(KEY_MODE, mode.name()).apply();
         Logger.info(LogConfig.MODULE_UI, "Mode changed to: " + mode);
     }
 
@@ -121,7 +162,7 @@ public class MainViewModel extends AndroidViewModel {
             localServerRunning.setValue(true);
             Logger.info(LogConfig.MODULE_UI, "Local server started successfully on port " + localServerPort);
         } else {
-            errorMessage.setValue("启动本地服务器失败");
+            setErrorMessage("启动本地服务器失败");
             Logger.error(LogConfig.MODULE_UI, "Failed to start local server");
         }
     }
@@ -180,7 +221,14 @@ public class MainViewModel extends AndroidViewModel {
     }
 
     /**
-     * 停止状态更新
+     * 进程死亡后恢复时启动统计更新（不重置时长）
+     */
+    public void startStatsUpdateAfterRestore() {
+        startStatsUpdate();
+    }
+
+    /**
+     * 停止状态更新（不重置 stats，等 VPN 服务广播自然更新）
      */
     private void stopStatsUpdate() {
         updatingStats.set(false);
@@ -188,9 +236,6 @@ public class MainViewModel extends AndroidViewModel {
             statsUpdateThread.interrupt();
             statsUpdateThread = null;
         }
-        duration.setValue(0L);
-        uploadBytes.setValue(0L);
-        downloadBytes.setValue(0L);
     }
 
     /**
@@ -209,17 +254,17 @@ public class MainViewModel extends AndroidViewModel {
     }
 
     /**
-     * 清除错误消息（用于 SingleLiveEvent 模式）
-     */
-    public void clearErrorMessage() {
-        errorMessage.setValue(null);
-    }
-
-    /**
      * 设置错误消息
      */
     public void setErrorMessage(String message) {
-        errorMessage.setValue(message);
+        errorMessage.setValue(new Event<>(message));
+    }
+
+    /**
+     * 获取错误消息（返回 Event 包装器，由 Fragment 决定是否消费）
+     */
+    public LiveData<Event<String>> getErrorMessage() {
+        return errorMessage;
     }
 
     /**
@@ -263,13 +308,6 @@ public class MainViewModel extends AndroidViewModel {
      */
     public LiveData<Boolean> getLocalServerRunning() {
         return localServerRunning;
-    }
-
-    /**
-     * 获取错误消息
-     */
-    public LiveData<String> getErrorMessage() {
-        return errorMessage;
     }
 
     @Override
