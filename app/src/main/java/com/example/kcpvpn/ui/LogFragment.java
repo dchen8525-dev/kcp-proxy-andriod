@@ -40,6 +40,8 @@ public class LogFragment extends Fragment {
     private LogLevel currentLogLevel = LogLevel.DEBUG;
     private Consumer<LogEntry> logListener;
 
+    private static final String STATE_LOG_LEVEL = "log_level";
+
     public LogFragment() {
         // Required empty public constructor
     }
@@ -54,15 +56,21 @@ public class LogFragment extends Fragment {
     public void onViewCreated(View view, Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        try {
-            viewModel = new ViewModelProvider(requireActivity()).get(MainViewModel.class);
-        } catch (Exception e) {
-            // Fragment可能还没attach到Activity
-        }
+        viewModel = new ViewModelProvider(requireActivity()).get(MainViewModel.class);
 
         initViews(view);
         setupRecyclerView();
         setupListeners();
+
+        if (savedInstanceState != null) {
+            int levelOrdinal = savedInstanceState.getInt(STATE_LOG_LEVEL, LogLevel.DEBUG.ordinal());
+            for (LogLevel level : LogLevel.values()) {
+                if (level.ordinal() == levelOrdinal) {
+                    currentLogLevel = level;
+                    break;
+                }
+            }
+        }
     }
 
     @Override
@@ -75,6 +83,12 @@ public class LogFragment extends Fragment {
 
         // 刷新已有日志
         refreshLogs();
+    }
+
+    @Override
+    public void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putInt(STATE_LOG_LEVEL, currentLogLevel.ordinal());
     }
 
     @Override
@@ -101,7 +115,8 @@ public class LogFragment extends Fragment {
             WeakReference<LogFragment> weakThis = new WeakReference<>(this);
             logListener = entry -> {
                 LogFragment fragment = weakThis.get();
-                if (fragment != null && fragment.isAdded() && fragment.getActivity() != null) {
+                if (fragment != null && fragment.isAdded() && !fragment.isRemoving()
+                        && fragment.getActivity() != null && !fragment.getActivity().isFinishing()) {
                     if (entry.getLevel().getValue() >= fragment.currentLogLevel.getValue()) {
                         fragment.addLogEntry(entry);
                     }
@@ -123,7 +138,23 @@ public class LogFragment extends Fragment {
         ArrayAdapter<String> adapter = new ArrayAdapter<>(requireContext(),
                 android.R.layout.simple_dropdown_item_1line, levels);
         spinnerLogLevel.setAdapter(adapter);
-        spinnerLogLevel.setText(levels[0], false);
+        // 根据恢复的currentLogLevel设置初始显示
+        int levelIndex = 0;
+        switch (currentLogLevel) {
+            case DEBUG:
+                levelIndex = 0;
+                break;
+            case INFO:
+                levelIndex = 2;
+                break;
+            case WARNING:
+                levelIndex = 3;
+                break;
+            case ERROR:
+                levelIndex = 4;
+                break;
+        }
+        spinnerLogLevel.setText(levels[levelIndex], false);
     }
 
     /**
@@ -178,21 +209,26 @@ public class LogFragment extends Fragment {
      * 添加日志条目
      */
     private void addLogEntry(LogEntry entry) {
-        if (getActivity() != null && isAdded()) {
-            getActivity().runOnUiThread(() -> {
-                if (logAdapter != null && isAdded()) {
-                    logAdapter.addLog(entry);
-                    recyclerView.scrollToPosition(logAdapter.getItemCount() - 1);
-                }
-            });
+        android.app.Activity activity = getActivity();
+        if (activity == null || !isAdded() || isRemoving() || activity.isFinishing()) {
+            return;
         }
+        activity.runOnUiThread(() -> {
+            if (logAdapter == null || !isAdded() || isRemoving()) {
+                return;
+            }
+            logAdapter.addLog(entry);
+            if (recyclerView != null) {
+                recyclerView.scrollToPosition(logAdapter.getItemCount() - 1);
+            }
+        });
     }
 
     /**
      * 刷新日志
      */
     private void refreshLogs() {
-        if (logAdapter == null) return;
+        if (logAdapter == null || recyclerView == null) return;
 
         List<LogEntry> logs = Logger.getInstance().getBuffer().getByLevel(currentLogLevel);
         logAdapter.updateLogs(logs);

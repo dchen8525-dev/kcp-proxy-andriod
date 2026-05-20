@@ -1,9 +1,10 @@
 package com.example.kcpvpn.ui;
 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.fragment.app.Fragment;
 import androidx.lifecycle.ViewModelProvider;
 
-import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
 import android.view.LayoutInflater;
@@ -57,16 +58,49 @@ public class MainFragment extends Fragment {
     private TextView tvUpload;
     private TextView tvDownload;
 
-    // VPN 授权请求码
-    private static final int VPN_AUTH_REQUEST_CODE = 1001;
-    private static final String STATE_WAITING_VPN_AUTH = "waiting_vpn_auth";
     private static final String STATE_SERVER_IP = "server_ip";
     private static final String STATE_SERVER_PORT = "server_port";
     private static final String STATE_KEY = "key";
     private boolean waitingVpnAuth = false;
 
+    private ActivityResultLauncher<Intent> vpnAuthLauncher;
+
+    private final MaterialButtonToggleGroup.OnButtonCheckedListener modeChangeListener = (group, checkedId, isChecked) -> {
+        if (isChecked) {
+            if (checkedId == R.id.btn_remote_mode) {
+                viewModel.setMode(MainViewModel.Mode.REMOTE);
+                remoteConfigLayout.setVisibility(View.VISIBLE);
+                localConfigLayout.setVisibility(View.GONE);
+            } else if (checkedId == R.id.btn_local_mode) {
+                viewModel.setMode(MainViewModel.Mode.LOCAL);
+                remoteConfigLayout.setVisibility(View.GONE);
+                localConfigLayout.setVisibility(View.VISIBLE);
+            }
+        }
+    };
+
     public MainFragment() {
         // Required empty public constructor
+    }
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        vpnAuthLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    waitingVpnAuth = false;
+                    if (result.getResultCode() == android.app.Activity.RESULT_OK) {
+                        Logger.info(LogConfig.MODULE_UI, "VPN authorization granted");
+                        startConnection();
+                    } else {
+                        Logger.warning(LogConfig.MODULE_UI, "VPN authorization denied");
+                        View view = getView();
+                        if (view != null && isAdded() && !isRemoving()) {
+                            Snackbar.make(view, "VPN 授权被拒绝", Snackbar.LENGTH_SHORT).show();
+                        }
+                    }
+                });
     }
 
     @Override
@@ -86,19 +120,24 @@ public class MainFragment extends Fragment {
         setupListeners();
         setupObservers();
 
-        // 恢复模式选择
+        // 恢复模式选择（先移除监听器避免触发事件，恢复后再添加）
+        modeToggleGroup.removeOnButtonCheckedListener(modeChangeListener);
         MainViewModel.Mode savedMode = viewModel.getMode();
         if (savedMode == MainViewModel.Mode.LOCAL) {
             modeToggleGroup.check(R.id.btn_local_mode);
+            remoteConfigLayout.setVisibility(View.GONE);
+            localConfigLayout.setVisibility(View.VISIBLE);
         } else {
             modeToggleGroup.check(R.id.btn_remote_mode);
+            remoteConfigLayout.setVisibility(View.VISIBLE);
+            localConfigLayout.setVisibility(View.GONE);
         }
+        modeToggleGroup.addOnButtonCheckedListener(modeChangeListener);
     }
 
     @Override
     public void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        outState.putBoolean(STATE_WAITING_VPN_AUTH, waitingVpnAuth);
         // 保存输入框内容
         if (etServerIp != null) {
             outState.putString(STATE_SERVER_IP, etServerIp.getText() != null
@@ -118,18 +157,20 @@ public class MainFragment extends Fragment {
     public void onViewStateRestored(Bundle savedInstanceState) {
         super.onViewStateRestored(savedInstanceState);
         if (savedInstanceState != null) {
-            waitingVpnAuth = savedInstanceState.getBoolean(STATE_WAITING_VPN_AUTH, false);
-            // 恢复输入框内容
+            // 恢复输入框内容（TextInputEditText自身也会恢复，但显式恢复更可靠）
             String ip = savedInstanceState.getString(STATE_SERVER_IP);
             String port = savedInstanceState.getString(STATE_SERVER_PORT);
             String key = savedInstanceState.getString(STATE_KEY);
-            if (ip != null && etServerIp != null) {
+            if (ip != null && etServerIp != null && etServerIp.getText() != null
+                    && etServerIp.getText().length() == 0) {
                 etServerIp.setText(ip);
             }
-            if (port != null && etServerPort != null) {
+            if (port != null && etServerPort != null && etServerPort.getText() != null
+                    && etServerPort.getText().length() == 0) {
                 etServerPort.setText(port);
             }
-            if (key != null && etKey != null) {
+            if (key != null && etKey != null && etKey.getText() != null
+                    && etKey.getText().length() == 0) {
                 etKey.setText(key);
             }
         }
@@ -172,19 +213,7 @@ public class MainFragment extends Fragment {
      */
     private void setupListeners() {
         // 模式切换
-        modeToggleGroup.addOnButtonCheckedListener((group, checkedId, isChecked) -> {
-            if (isChecked) {
-                if (checkedId == R.id.btn_remote_mode) {
-                    viewModel.setMode(MainViewModel.Mode.REMOTE);
-                    remoteConfigLayout.setVisibility(View.VISIBLE);
-                    localConfigLayout.setVisibility(View.GONE);
-                } else if (checkedId == R.id.btn_local_mode) {
-                    viewModel.setMode(MainViewModel.Mode.LOCAL);
-                    remoteConfigLayout.setVisibility(View.GONE);
-                    localConfigLayout.setVisibility(View.VISIBLE);
-                }
-            }
-        });
+        modeToggleGroup.addOnButtonCheckedListener(modeChangeListener);
 
         // 启动本地服务
         btnStartLocalServer.setOnClickListener(v -> {
@@ -213,7 +242,7 @@ public class MainFragment extends Fragment {
             if (vpnIntent != null) {
                 waitingVpnAuth = true;
                 btnConnect.setEnabled(false);
-                startActivityForResult(vpnIntent, VPN_AUTH_REQUEST_CODE);
+                vpnAuthLauncher.launch(vpnIntent);
             } else {
                 startConnection();
             }
@@ -320,25 +349,6 @@ public class MainFragment extends Fragment {
         }
     }
 
-    @Override
-    public void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-
-        if (requestCode == VPN_AUTH_REQUEST_CODE) {
-            waitingVpnAuth = false;
-            if (resultCode == Activity.RESULT_OK) {
-                Logger.info(LogConfig.MODULE_UI, "VPN authorization granted");
-                startConnection();
-            } else {
-                Logger.warning(LogConfig.MODULE_UI, "VPN authorization denied");
-                View view = getView();
-                if (view != null && isAdded()) {
-                    Snackbar.make(view, "VPN 授权被拒绝", Snackbar.LENGTH_SHORT).show();
-                }
-            }
-        }
-    }
-
     /**
      * 格式化时长
      */
@@ -374,8 +384,11 @@ public class MainFragment extends Fragment {
      */
     private void showSnackbar(String message) {
         View view = getView();
-        if (view != null && isAdded()) {
-            Snackbar.make(view, message, Snackbar.LENGTH_SHORT).show();
+        if (view != null && isAdded() && !isRemoving()) {
+            android.app.Activity activity = getActivity();
+            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
+                Snackbar.make(view, message, Snackbar.LENGTH_SHORT).show();
+            }
         }
     }
 
@@ -384,8 +397,11 @@ public class MainFragment extends Fragment {
      */
     private void showSnackbarLong(String message) {
         View view = getView();
-        if (view != null && isAdded()) {
-            Snackbar.make(view, message, Snackbar.LENGTH_LONG).show();
+        if (view != null && isAdded() && !isRemoving()) {
+            android.app.Activity activity = getActivity();
+            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
+                Snackbar.make(view, message, Snackbar.LENGTH_LONG).show();
+            }
         }
     }
 }

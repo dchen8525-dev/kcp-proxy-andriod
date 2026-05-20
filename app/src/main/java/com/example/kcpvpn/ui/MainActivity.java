@@ -142,11 +142,15 @@ public class MainActivity extends AppCompatActivity {
         }
 
         FragmentManager fm = getSupportFragmentManager();
+        if (fm.isStateSaved()) {
+            return;
+        }
+
         FragmentTransaction transaction = fm.beginTransaction();
 
         transaction.hide(activeFragment);
         transaction.show(targetFragment);
-        transaction.commit();
+        transaction.commitNowAllowingStateLoss();
 
         activeFragment = targetFragment;
     }

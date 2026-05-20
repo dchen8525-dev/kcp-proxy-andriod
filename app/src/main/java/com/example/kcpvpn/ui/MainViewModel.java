@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 一次性事件包装器，防止配置变化时重复消费
  */
-public class Event<T> {
+class Event<T> {
     private final T content;
     private final AtomicBoolean handled = new AtomicBoolean(false);
 
@@ -224,7 +224,20 @@ public class MainViewModel extends AndroidViewModel {
      * 进程死亡后恢复时启动统计更新（不重置时长）
      */
     public void startStatsUpdateAfterRestore() {
-        startStatsUpdate();
+        if (!updatingStats.compareAndSet(false, true)) {
+            return;
+        }
+
+        statsUpdateThread = new Thread(() -> {
+            while (updatingStats.get()) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }, "Stats-Update-Restore");
+        statsUpdateThread.start();
     }
 
     /**
