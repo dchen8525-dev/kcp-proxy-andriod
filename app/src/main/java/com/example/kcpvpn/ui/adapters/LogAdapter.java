@@ -26,6 +26,8 @@ public class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
     private List<LogEntry> logs;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    private static final int MAX_LOGS = 500;
+
     private static final int COLOR_DEBUG = Color.GRAY;
     private static final int COLOR_INFO = 0xFF2196F3;      // 蓝色
     private static final int COLOR_WARNING = 0xFFFF9800;   // 橙色
@@ -59,14 +61,19 @@ public class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
      */
     public void addLog(LogEntry entry) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            logs.add(entry);
-            notifyItemInserted(logs.size() - 1);
+            addLogInternal(entry);
         } else {
-            mainHandler.post(() -> {
-                logs.add(entry);
-                notifyItemInserted(logs.size() - 1);
-            });
+            mainHandler.post(() -> addLogInternal(entry));
         }
+    }
+
+    private void addLogInternal(LogEntry entry) {
+        if (logs.size() >= MAX_LOGS) {
+            logs.remove(0);
+            notifyItemRemoved(0);
+        }
+        logs.add(entry);
+        notifyItemInserted(logs.size() - 1);
     }
 
     /**
@@ -99,6 +106,17 @@ public class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
                 notifyDataSetChanged();
             });
         }
+    }
+
+    /**
+     * 获取所有日志的格式化文本（用于复制）
+     */
+    public String getLogsText() {
+        StringBuilder sb = new StringBuilder();
+        for (LogEntry entry : logs) {
+            sb.append(entry.format()).append("\n");
+        }
+        return sb.toString();
     }
 
     /**

@@ -16,9 +16,11 @@ public class Kcp {
     // KCP 常量
     private static final int IKCP_RTO_NDL = 30;    // nodelay 模式最小 RTO
     private static final int IKCP_RTO_DEF = 200;    // 默认 RTO
+    private static final int IKCP_RTO_MIN = 100;    // 最小 RTO
     private static final int IKCP_THRESH_INIT = 2;   // 慢启动初始阈值
     private static final int IKCP_THRESH_MIN = 2;    // 最小阈值
     private static final int IKCP_DEADLINK = 20;     // 死链判定（与 C 一致）
+    private static final int IKCP_FASTACK_LIMIT = 5; // 快速重传次数限制（与 ikcp.h 一致）
 
     // KCP 状态
     private int conv;
@@ -185,10 +187,6 @@ public class Kcp {
             return -2;
         }
 
-        if (snd_queue.size() + snd_buf.size() >= snd_wnd) {
-            return -2;
-        }
-
         // 创建分片
         int sent = 0;
         for (int i = 0; i < count; i++) {
@@ -294,6 +292,8 @@ public class Kcp {
         }
 
         long oldSndUna = snd_una;
+        int maxack = 0;
+        int latestTs = 0;
 
         ByteBuffer buf = ByteBuffer.wrap(data, offset, len);
         buf.order(ByteOrder.LITTLE_ENDIAN);
@@ -321,13 +321,21 @@ public class Kcp {
 
             // 处理 una — 移除已确认的段
             parseUna(una);
+            shrinkSndBuf();
 
             switch (cmd) {
                 case Segment.IKCP_CMD_ACK:
                     // 处理 ACK — 更新 RTT, fastack, cwnd
-                    handleAck(sn, ts);
-                    // 更新 fastack：对在 snd_una~sn 范围内的段增加 fastack
-                    parseFastAck(sn);
+                    if (timeDiff(current, ts) >= 0) {
+                        updateRtt(timeDiff(current, ts));
+                    }
+                    handleAck(sn);
+                    shrinkSndBuf();
+                    // 跟踪最大 ACK 用于批量 fastack
+                    if (timeDiff(sn, maxack) > 0) {
+                        maxack = sn;
+                        latestTs = ts;
+                    }
                     break;
 
                 case Segment.IKCP_CMD_PUSH:
@@ -350,6 +358,11 @@ public class Kcp {
             }
         }
 
+        // 批量 fastack：使用最大 ACK 号一次性处理
+        if (maxack > 0) {
+            parseFastAck(maxack);
+        }
+
         // cwnd 增长逻辑（与 ikcp.c ikcp_input 一致）
         if (timeDiff(snd_una, (int) oldSndUna) > 0) {
             // 有段被确认，增长拥塞窗口
@@ -360,21 +373,18 @@ public class Kcp {
                     incr += mss;
                 } else {
                     // 拥塞避免：每 MSS/cwnd 个段确认，cwnd 加 1
-                    incr += mss * mss / cwnd;
-                    if (incr >= mss) {
-                        incr -= mss;
-                        cwnd++;
+                    if (incr < mss) incr = mss;
+                    incr += (mss * mss) / incr + (mss / 16);
+                    if ((cwnd + 1) * mss <= incr) {
+                        cwnd = (incr + mss - 1) / ((mss > 0) ? mss : 1);
                     }
                 }
                 if (cwnd > rmt_wnd) {
                     cwnd = rmt_wnd;
+                    incr = rmt_wnd * mss;
                 }
             }
         }
-
-        // 更新 snd_una（由 parseUna 处理）
-        // shrink_snd_buf
-        shrinkSndBuf();
 
         updated = 1;
         return 0;
@@ -384,7 +394,7 @@ public class Kcp {
      * 处理 ACK — 与 ikcp.c ikcp_parse_ack 一致
      * 从 snd_buf 中移除已确认的段（而不是仅标记）
      */
-    private void handleAck(int sn, int ts) {
+    private void handleAck(int sn) {
         if (timeDiff(sn, snd_una) < 0 || timeDiff(sn, snd_nxt) >= 0) {
             return;
         }
@@ -394,7 +404,6 @@ public class Kcp {
             Segment seg = snd_buf.get(i);
             if (seg.sn == sn) {
                 snd_buf.remove(i);
-                updateRtt(timeDiff(current, ts));
                 break;
             }
             if (timeDiff(seg.sn, sn) > 0) {
@@ -442,14 +451,9 @@ public class Kcp {
      * 处理 una — 移除 sn < una 的段
      */
     private void parseUna(int una) {
-        if (timeDiff(una, snd_una) <= 0) {
-            return;
-        }
-
-        snd_una = una;
         while (!snd_buf.isEmpty()) {
             Segment seg = snd_buf.peekFirst();
-            if (timeDiff(seg.sn, snd_una) < 0) {
+            if (timeDiff(una, seg.sn) > 0) {
                 snd_buf.pollFirst();
             } else {
                 break;
@@ -463,6 +467,8 @@ public class Kcp {
     private void shrinkSndBuf() {
         if (!snd_buf.isEmpty()) {
             snd_una = snd_buf.peekFirst().sn;
+        } else {
+            snd_una = snd_nxt;
         }
     }
 
@@ -594,15 +600,17 @@ public class Kcp {
      */
     public void flush() {
         // 计算窗口大小
-        int wnd = Math.min(rmt_wnd, snd_wnd);
+        int cwndSize = Math.min(rmt_wnd, snd_wnd);
         if (!nocwnd) {
-            wnd = Math.min(wnd, cwnd);
+            cwndSize = Math.min(cwndSize, cwnd);
         }
-        if (wnd == 0) {
-            wnd = 1;
+        if (cwndSize < 0) {
+            cwndSize = 0;
         }
 
         int count = 0;
+        boolean lost = false;
+        boolean change = false;
 
         // 发送窗口探测
         if ((probe & 1) != 0) {
@@ -625,38 +633,48 @@ public class Kcp {
         // 计算 una（使用 rcv_nxt，不是 snd_una）
         int una = rcv_nxt;
 
-        // 发送发送缓冲区中的数据（先处理超时重传）
+        // 发送发送缓冲区中的数据（先处理超时重传和快速重传）
         for (Segment seg : snd_buf) {
-            // 检查超时重传
+            boolean needSend = false;
             boolean needResend = false;
 
             if (seg.xmit == 0) {
-                // 首次发送（还未发送过 — 不应出现在 snd_buf 中，正常流程中 xmit 在 flush 时设为 1）
-                needResend = false;
+                // 首次发送
+                needSend = true;
+                seg.xmit = 1;
+                seg.rto = rx_rto;
+                seg.resendts = current + seg.rto;
             } else if (timeDiff(current, seg.resendts) >= 0) {
                 // 超时重传
+                needSend = true;
                 needResend = true;
+                if (nodelay == 0) {
+                    seg.rto += Math.max(seg.rto, rx_rto);
+                } else {
+                    int step = (nodelay < 2) ? seg.rto : rx_rto;
+                    seg.rto += step / 2;
+                }
+                seg.resendts = current + seg.rto;
+                lost = true;
             } else if (seg.fastack >= fastresend && fastresend > 0) {
                 // 快速重传
-                if (seg.xmit <= 10) {  // 限制快速重传次数
+                if ((seg.xmit <= IKCP_FASTACK_LIMIT) || (IKCP_FASTACK_LIMIT <= 0)) {
+                    needSend = true;
                     needResend = true;
+                    seg.fastack = 0;
+                    seg.resendts = current + seg.rto;
+                    change = true;
                 }
             }
 
-            if (needResend) {
+            if (needSend) {
                 if (seg.xmit >= dead_link) {
                     state = -1;  // 死链
                     return;
                 }
 
-                if (timeDiff(current, seg.resendts) >= 0) {
-                    // 超时重传：更新 RTO 和 resendts
-                    seg.rto = Math.min(rx_rto * 2, 6000);  // 每次重传 RTO 翻倍
-                    seg.resendts = current + seg.rto;
-                }
-
-                seg.fastack = 0;
                 seg.xmit++;
+                seg.ts = current;
                 seg.wnd = rcv_queue.size() < rcv_wnd ? rcv_wnd - rcv_queue.size() : 0;
                 seg.una = una;
                 sendSegment(seg);
@@ -664,8 +682,24 @@ public class Kcp {
             }
         }
 
+        // 拥塞控制：超时重传时降低 ssthresh
+        if (lost) {
+            ssthresh = Math.max(cwnd / 2, IKCP_THRESH_MIN);
+            cwnd = ssthresh;
+            incr = cwnd * mss;
+        }
+
+        // 拥塞控制：快速重传时降低 ssthresh
+        if (change) {
+            ssthresh = Math.max(cwnd / 2, IKCP_THRESH_MIN);
+            incr = ssthresh * mss;
+            if (cwnd > ssthresh) {
+                cwnd = ssthresh;
+            }
+        }
+
         // 发送发送队列中的新数据
-        while (!snd_queue.isEmpty() && count < wnd) {
+        while (!snd_queue.isEmpty() && timeDiff(snd_nxt, snd_una + cwndSize) < 0) {
             Segment seg = snd_queue.pollFirst();
             seg.conv = conv;
             seg.cmd = Segment.IKCP_CMD_PUSH;
@@ -675,7 +709,7 @@ public class Kcp {
             seg.una = una;
             seg.resendts = current + rx_rto;
             seg.rto = rx_rto;
-            seg.xmit = 1;  // 首次发送，xmit=1
+            seg.xmit = 0;  // 首次发送，xmit=0（与 C++ 一致）
             seg.fastack = 0;
             snd_buf.add(seg);
             sendSegment(seg);
@@ -684,6 +718,13 @@ public class Kcp {
             // 首次发送时增长 cwnd（慢启动）
             if (cwnd < rmt_wnd && cwnd < ssthresh) {
                 cwnd++;
+                incr += mss;
+            } else if (cwnd >= ssthresh) {
+                if (incr < mss) incr = mss;
+                incr += (mss * mss) / incr + (mss / 16);
+                if ((cwnd + 1) * mss <= incr) {
+                    cwnd++;
+                }
             }
         }
 

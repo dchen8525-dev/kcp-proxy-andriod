@@ -138,10 +138,9 @@ public class LocalKcpServer {
             Logger.info(LogConfig.MODULE_KCP_SERVER, "New session: " + sessionId
                     + " (total: " + sessions.size() + ")");
         } else {
-            // 已有会话，处理数据
+            // 已有会话，使用会话绑定的 crypto 解密处理数据
             try {
-                Crypto crypto = new Crypto(key, CryptoConfig.NONCE_DIR_SERVER, "");
-                byte[] decrypted = crypto.decrypt(encryptedData);
+                byte[] decrypted = session.getCrypto().decrypt(encryptedData);
                 session.receiveData(decrypted);
             } catch (Exception e) {
                 Logger.error(LogConfig.MODULE_KCP_SERVER, "Decrypt error: " + e.getMessage());
@@ -266,13 +265,29 @@ public class LocalKcpServer {
 
         Logger.info(LogConfig.MODULE_KCP_SERVER, "Server stopping...");
 
-        // 停止线程
+        // 先关闭 socket，解除 recvThread 的 DatagramSocket.receive 阻塞
+        if (udpSocket != null) {
+            udpSocket.close();
+            udpSocket = null;
+        }
+
+        // 再中断并等待线程
         if (recvThread != null) {
             recvThread.interrupt();
+            try {
+                recvThread.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             recvThread = null;
         }
         if (cleanupThread != null) {
             cleanupThread.interrupt();
+            try {
+                cleanupThread.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             cleanupThread = null;
         }
 
@@ -284,12 +299,6 @@ public class LocalKcpServer {
 
         // 关闭所有连接
         connectionManager.closeAll();
-
-        // 关闭 socket
-        if (udpSocket != null) {
-            udpSocket.close();
-            udpSocket = null;
-        }
 
         Logger.info(LogConfig.MODULE_KCP_SERVER, "Server stopped");
     }

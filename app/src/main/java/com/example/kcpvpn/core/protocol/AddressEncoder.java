@@ -96,7 +96,8 @@ public class AddressEncoder {
      * 编码域名 — 使用 byte 长度而非 char 长度
      */
     private static byte[] encodeDomain(String host, int port) {
-        byte[] domainBytes = host.getBytes(StandardCharsets.US_ASCII);
+        // 使用 UTF-8 与 C++ 端保持一致（C++ 直接迭代 char 字节，在 UTF-8 系统上行为一致）
+        byte[] domainBytes = host.getBytes(StandardCharsets.UTF_8);
         if (domainBytes.length > 255) {
             throw new IllegalArgumentException("Domain name too long");
         }

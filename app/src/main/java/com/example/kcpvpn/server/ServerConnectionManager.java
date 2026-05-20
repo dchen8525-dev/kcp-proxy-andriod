@@ -55,8 +55,17 @@ public class ServerConnectionManager {
      * 关闭所有连接
      */
     public void closeAll() {
-        for (String sessionId : connections.keySet()) {
-            closeConnection(sessionId);
+        for (java.util.Iterator<java.util.Map.Entry<String, Socket>> it =
+                connections.entrySet().iterator(); it.hasNext(); ) {
+            java.util.Map.Entry<String, Socket> entry = it.next();
+            try {
+                if (!entry.getValue().isClosed()) {
+                    entry.getValue().close();
+                }
+            } catch (IOException e) {
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "Close socket error: " + e.getMessage());
+            }
+            it.remove();
         }
         Logger.info(LogConfig.MODULE_KCP_SERVER, "All connections closed");
     }

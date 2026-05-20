@@ -323,6 +323,12 @@ public class MainFragment extends Fragment {
                 return;
             }
 
+            // IP 地址格式验证
+            if (!isValidIpAddress(host)) {
+                showSnackbar("IP 地址格式不正确");
+                return;
+            }
+
             int port;
             try {
                 port = Integer.parseInt(portStr);
@@ -377,6 +383,31 @@ public class MainFragment extends Fragment {
         } else {
             return String.format("%.1f GB", bytes / (1024.0 * 1024 * 1024));
         }
+    }
+
+    /**
+     * 验证 IP 地址格式（支持 IPv4 和域名）
+     */
+    private static boolean isValidIpAddress(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        // IPv4 验证
+        if (host.matches("^(\\d{1,3}\\.){3}\\d{1,3}$")) {
+            String[] parts = host.split("\\.");
+            for (String part : parts) {
+                int val = Integer.parseInt(part);
+                if (val < 0 || val > 255) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // 域名验证：至少包含一个点，且不以点开头或结尾
+        if (host.contains(".") && !host.startsWith(".") && !host.endsWith(".")) {
+            return host.matches("^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$");
+        }
+        return false;
     }
 
     /**

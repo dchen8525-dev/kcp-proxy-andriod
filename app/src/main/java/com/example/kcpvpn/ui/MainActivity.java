@@ -29,8 +29,6 @@ public class MainActivity extends AppCompatActivity {
     private MainViewModel viewModel;
     private BottomNavigationView bottomNav;
 
-    private MainFragment mainFragment;
-    private LogFragment logFragment;
     private Fragment activeFragment;
 
     private BroadcastReceiver stateReceiver;
@@ -74,28 +72,24 @@ public class MainActivity extends AppCompatActivity {
      * 获取或创建MainFragment
      */
     private MainFragment getMainFragment() {
-        if (mainFragment == null) {
-            FragmentManager fm = getSupportFragmentManager();
-            mainFragment = (MainFragment) fm.findFragmentByTag("main");
-            if (mainFragment == null) {
-                mainFragment = new MainFragment();
-            }
+        FragmentManager fm = getSupportFragmentManager();
+        MainFragment fragment = (MainFragment) fm.findFragmentByTag("main");
+        if (fragment == null) {
+            fragment = new MainFragment();
         }
-        return mainFragment;
+        return fragment;
     }
 
     /**
      * 获取或创建LogFragment
      */
     private LogFragment getLogFragment() {
-        if (logFragment == null) {
-            FragmentManager fm = getSupportFragmentManager();
-            logFragment = (LogFragment) fm.findFragmentByTag("log");
-            if (logFragment == null) {
-                logFragment = new LogFragment();
-            }
+        FragmentManager fm = getSupportFragmentManager();
+        LogFragment fragment = (LogFragment) fm.findFragmentByTag("log");
+        if (fragment == null) {
+            fragment = new LogFragment();
         }
-        return logFragment;
+        return fragment;
     }
 
     /**

@@ -67,7 +67,7 @@ public class AddressParser {
                 if (offset + 2 + domainLen + 2 > len) {
                     throw new IllegalArgumentException("Insufficient data for domain address");
                 }
-                result.host = new String(data, offset + 2, domainLen, StandardCharsets.US_ASCII);
+                result.host = new String(data, offset + 2, domainLen, StandardCharsets.UTF_8);
                 int portOffset = offset + 2 + domainLen;
                 result.port = ((data[portOffset] & 0xFF) << 8) | (data[portOffset + 1] & 0xFF);
                 result.bytesConsumed = 4 + domainLen;

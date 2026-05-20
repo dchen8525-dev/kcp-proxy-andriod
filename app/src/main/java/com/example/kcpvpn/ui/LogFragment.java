@@ -6,6 +6,9 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import android.os.Bundle;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -14,6 +17,7 @@ import android.widget.AutoCompleteTextView;
 import android.widget.Button;
 
 import com.example.kcpvpn.R;
+import com.google.android.material.snackbar.Snackbar;
 import com.example.kcpvpn.log.LogBuffer;
 import com.example.kcpvpn.log.LogEntry;
 import com.example.kcpvpn.log.LogLevel;
@@ -34,6 +38,7 @@ public class LogFragment extends Fragment {
     private LogAdapter logAdapter;
     private RecyclerView recyclerView;
     private AutoCompleteTextView spinnerLogLevel;
+    private Button btnCopyLog;
     private Button btnClearLog;
 
     // 初始显示所有日志，使用最低级别 DEBUG（value=0）作为"全部"
@@ -131,6 +136,7 @@ public class LogFragment extends Fragment {
     private void initViews(View view) {
         recyclerView = view.findViewById(R.id.recycler_log);
         spinnerLogLevel = view.findViewById(R.id.spinner_log_filter);
+        btnCopyLog = view.findViewById(R.id.btn_copy_log);
         btnClearLog = view.findViewById(R.id.btn_clear_log);
 
         // 设置日志级别下拉：全部=DEBUG最低级, 其他按级别递增
@@ -197,12 +203,46 @@ public class LogFragment extends Fragment {
             refreshLogs();
         });
 
+        btnCopyLog.setOnClickListener(v -> copyLogsToClipboard());
+
         btnClearLog.setOnClickListener(v -> {
             Logger.getInstance().clear();
             if (logAdapter != null) {
                 logAdapter.clear();
             }
         });
+    }
+
+    /**
+     * 复制日志到剪贴板
+     */
+    private void copyLogsToClipboard() {
+        if (logAdapter == null || logAdapter.getItemCount() == 0) {
+            showSnackbar("没有日志可复制");
+            return;
+        }
+
+        String logsText = logAdapter.getLogsText();
+        ClipboardManager clipboard = (ClipboardManager) requireContext()
+                .getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            ClipData clip = ClipData.newPlainText("KCP VPN Logs", logsText);
+            clipboard.setPrimaryClip(clip);
+            showSnackbar("已复制 " + logAdapter.getItemCount() + " 条日志到剪贴板");
+        }
+    }
+
+    /**
+     * 安全地显示 Snackbar
+     */
+    private void showSnackbar(String message) {
+        View view = getView();
+        if (view != null && isAdded() && !isRemoving()) {
+            android.app.Activity activity = getActivity();
+            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
+                Snackbar.make(view, message, Snackbar.LENGTH_SHORT).show();
+            }
+        }
     }
 
     /**

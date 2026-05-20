@@ -32,8 +32,11 @@ public class ServerSession {
 
     private Thread updateThread;
 
-    private byte[] pendingReadBuffer;
-    private Consumer<byte[]> pendingReadHandler;
+    // KCP 对象锁
+    private final Object kcpLock = new Object();
+
+    private volatile byte[] pendingReadBuffer;
+    private volatile Consumer<byte[]> pendingReadHandler;
 
     /**
      * 创建服务端会话
@@ -89,10 +92,11 @@ public class ServerSession {
             while (running) {
                 try {
                     long nowMs = System.currentTimeMillis();
-                    kcp.update((int) (nowMs & 0xFFFFFFFFL));
-
-                    tryFulfillRead();
-
+                    synchronized (kcpLock) {
+                        kcp.update((int) (nowMs & 0xFFFFFFFFL));
+                        kcp.flush();
+                        tryFulfillRead();
+                    }
                     Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     break;
@@ -112,13 +116,15 @@ public class ServerSession {
 
         touchActivity();
 
-        int ret = kcp.input(decryptedData);
-        if (ret < 0) {
-            Logger.warning(LogConfig.MODULE_KCP_SERVER, "ikcp_input rejected packet, ret=" + ret);
-            return;
-        }
+        synchronized (kcpLock) {
+            int ret = kcp.input(decryptedData);
+            if (ret < 0) {
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "ikcp_input rejected packet, ret=" + ret);
+                return;
+            }
 
-        tryFulfillRead();
+            tryFulfillRead();
+        }
     }
 
     /**
@@ -148,13 +154,16 @@ public class ServerSession {
             return;
         }
 
-        int ret = kcp.send(data);
-        if (ret < 0) {
-            Logger.error(LogConfig.MODULE_KCP_SERVER, "ikcp_send failed, ret=" + ret);
-            return;
-        }
+        synchronized (kcpLock) {
+            int ret = kcp.send(data);
+            if (ret < 0) {
+                Logger.error(LogConfig.MODULE_KCP_SERVER, "ikcp_send failed, ret=" + ret);
+                return;
+            }
 
-        kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.flush();
+        }
 
         Logger.debug(LogConfig.MODULE_KCP_SERVER, "Sent " + data.length + " bytes");
     }
@@ -170,13 +179,15 @@ public class ServerSession {
 
         pendingReadBuffer = buffer;
         pendingReadHandler = handler;
-        tryFulfillRead();
+        synchronized (kcpLock) {
+            tryFulfillRead();
+        }
     }
 
     /**
      * 尝试读取数据
      */
-    private synchronized void tryFulfillRead() {
+    private void tryFulfillRead() {
         if (pendingReadBuffer == null || pendingReadHandler == null) {
             return;
         }
@@ -293,14 +304,20 @@ public class ServerSession {
 
         if (updateThread != null) {
             updateThread.interrupt();
+            try {
+                updateThread.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             updateThread = null;
         }
 
         // 清理等待的读取
-        if (pendingReadHandler != null) {
-            pendingReadHandler.accept(null);
+        Consumer<byte[]> handler = pendingReadHandler;
+        if (handler != null) {
             pendingReadHandler = null;
             pendingReadBuffer = null;
+            handler.accept(null);
         }
 
         Logger.info(LogConfig.MODULE_KCP_SERVER, "ServerSession stopped: " + sessionId);
@@ -318,5 +335,9 @@ public class ServerSession {
      */
     public InetSocketAddress getClientAddr() {
         return clientAddr;
+    }
+
+    public Crypto getCrypto() {
+        return crypto;
     }
 }

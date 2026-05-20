@@ -45,7 +45,7 @@ public class Socks5Handler {
         }
 
         try {
-            AddressParser.ParsedAddress addr = AddressParser.parse(data, 3, data.length - 3);
+            AddressParser.ParsedAddress addr = AddressParser.parse(data, 3, data.length);
 
             if (addr.host == null || addr.host.isEmpty()) {
                 Logger.warning(LogConfig.MODULE_SOCKS5, "Empty host in SOCKS5 request");
@@ -139,33 +139,40 @@ public class Socks5Handler {
         }, "TCP-to-KCP-" + session.getSessionId());
         tcpToKcpThread.start();
 
-        // KCP -> TCP 转发线程
+        // KCP -> TCP 转发线程（回调递归模式，避免覆盖 pendingReadHandler）
         Thread kcpToTcpThread = new Thread(() -> {
-            byte[] buffer = new byte[ServerConfig.FWD_BUF_SIZE];
-            while (session.isAlive() && tcpSocket.isConnected() && !tcpSocket.isClosed()) {
-                session.asyncReadSome(buffer, data -> {
-                    if (data == null || data.length == 0) {
-                        connectionManager.closeConnection(session.getSessionId());
-                        return;
-                    }
-
-                    try {
-                        tcpSocket.getOutputStream().write(data);
-                        Logger.debug(LogConfig.MODULE_KCP_SERVER, "KCP -> TCP: " + data.length + " bytes");
-                    } catch (IOException e) {
-                        Logger.error(LogConfig.MODULE_KCP_SERVER, "TCP write error: " + e.getMessage());
-                        connectionManager.closeConnection(session.getSessionId());
-                    }
-                });
-
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
+            forwardKcpToTcpRecursive(session, tcpSocket, connectionManager);
         }, "KCP-to-TCP-" + session.getSessionId());
         kcpToTcpThread.start();
+    }
+
+    /**
+     * 递归转发 KCP -> TCP（回调完成后再发起下一次读取，避免覆盖 pendingReadHandler）
+     */
+    private static void forwardKcpToTcpRecursive(ServerSession session, Socket tcpSocket,
+                                                   ServerConnectionManager connectionManager) {
+        if (!session.isAlive() || tcpSocket.isClosed()) {
+            connectionManager.closeConnection(session.getSessionId());
+            return;
+        }
+
+        final byte[] buffer = new byte[ServerConfig.FWD_BUF_SIZE];
+        session.asyncReadSome(buffer, data -> {
+            if (data == null || data.length == 0) {
+                connectionManager.closeConnection(session.getSessionId());
+                return;
+            }
+
+            try {
+                tcpSocket.getOutputStream().write(data);
+                Logger.debug(LogConfig.MODULE_KCP_SERVER, "KCP -> TCP: " + data.length + " bytes");
+                // 递归调用，发起下一次读取
+                forwardKcpToTcpRecursive(session, tcpSocket, connectionManager);
+            } catch (IOException e) {
+                Logger.error(LogConfig.MODULE_KCP_SERVER, "TCP write error: " + e.getMessage());
+                connectionManager.closeConnection(session.getSessionId());
+            }
+        });
     }
 
     /**

@@ -6,6 +6,9 @@ import com.example.kcpvpn.core.session.SessionConfig;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,6 +36,9 @@ public class TunnelManager {
     private static final int MAX_DELAY_MS = 60000;
     private static final int DELAY_FACTOR = 2;
 
+    // 重连定时器
+    private final ScheduledExecutorService reconnectExecutor;
+
     // 流量统计
     private final AtomicLong uploadBytes;
     private final AtomicLong downloadBytes;
@@ -53,6 +59,11 @@ public class TunnelManager {
         this.uploadBytes = new AtomicLong(0);
         this.downloadBytes = new AtomicLong(0);
         this.connectionStartTime = new AtomicLong(0);
+        this.reconnectExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "ReconnectThread");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     /**
@@ -207,11 +218,9 @@ public class TunnelManager {
         Logger.info(LogConfig.MODULE_RECONNECT, "Reconnect attempt " + attempts
                 + ", delay " + delay + "ms");
 
-        // 启动重连线程
-        new Thread(() -> {
+        // 使用 ScheduledExecutorService 调度重连，避免无限创建线程
+        reconnectExecutor.schedule(() -> {
             try {
-                Thread.sleep(delay);
-
                 if (connect()) {
                     Logger.info(LogConfig.MODULE_RECONNECT, "Reconnect successful");
                 } else {
@@ -221,11 +230,12 @@ public class TunnelManager {
 
                     Logger.warning(LogConfig.MODULE_RECONNECT, "Reconnect failed, next delay: " + newDelay + "ms");
                 }
-            } catch (InterruptedException e) {
-                Logger.debug(LogConfig.MODULE_RECONNECT, "Reconnect interrupted");
+            } catch (Exception e) {
+                Logger.error(LogConfig.MODULE_RECONNECT, "Reconnect error: " + e.getMessage());
+            } finally {
+                connecting.set(false);
             }
-            connecting.set(false);
-        }, "ReconnectThread").start();
+        }, delay, TimeUnit.MILLISECONDS);
     }
 
     /**

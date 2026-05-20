@@ -42,6 +42,9 @@ public class KcpClientSession {
     private Thread updateThread;
     private Thread recvThread;
 
+    // KCP 对象锁 — C++ ikcp.c 是单线程的，Java 移植必须由调用者同步
+    private final Object kcpLock = new Object();
+
     // pendingRead 字段使用 volatile 保证跨线程可见性
     private volatile byte[] pendingReadBuffer;
     private volatile Consumer<byte[]> pendingReadHandler;
@@ -113,8 +116,11 @@ public class KcpClientSession {
             while (running) {
                 try {
                     long nowMs = System.currentTimeMillis();
-                    kcp.update((int) (nowMs & 0xFFFFFFFFL));
-                    tryFulfillRead();
+                    synchronized (kcpLock) {
+                        kcp.update((int) (nowMs & 0xFFFFFFFFL));
+                        kcp.flush();
+                        tryFulfillRead();
+                    }
                     Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     break;
@@ -161,14 +167,16 @@ public class KcpClientSession {
             byte[] decrypted = crypto.decrypt(encryptedData);
             touchActivity();
 
-            int ret = kcp.input(decrypted);
-            if (ret < 0) {
-                Logger.warning("kcp_client", "ikcp_input rejected packet, ret=" + ret);
-                return;
-            }
+            synchronized (kcpLock) {
+                int ret = kcp.input(decrypted);
+                if (ret < 0) {
+                    Logger.warning("kcp_client", "ikcp_input rejected packet, ret=" + ret);
+                    return;
+                }
 
-            // 如果有数据接收回调且 KCP 中有数据，直接读取
-            tryDeliverData();
+                // 如果有数据接收回调且 KCP 中有数据，直接读取
+                tryDeliverData();
+            }
         } catch (Exception e) {
             Logger.error("kcp_client", "Receive error: " + e.getMessage());
         }
@@ -181,17 +189,19 @@ public class KcpClientSession {
         Consumer<byte[]> cb = onDataReceived;
         if (cb == null) return;
 
-        while (true) {
-            int peekSize = kcp.peekSize();
-            if (peekSize <= 0) break;
+        synchronized (kcpLock) {
+            while (true) {
+                int peekSize = kcp.peekSize();
+                if (peekSize <= 0) break;
 
-            byte[] buf = new byte[peekSize];
-            int len = kcp.recv(buf);
-            if (len <= 0) break;
+                byte[] buf = new byte[peekSize];
+                int len = kcp.recv(buf);
+                if (len <= 0) break;
 
-            byte[] data = new byte[len];
-            System.arraycopy(buf, 0, data, 0, len);
-            cb.accept(data);
+                byte[] data = new byte[len];
+                System.arraycopy(buf, 0, data, 0, len);
+                cb.accept(data);
+            }
         }
     }
 
@@ -220,13 +230,16 @@ public class KcpClientSession {
             return;
         }
 
-        int ret = kcp.send(data);
-        if (ret < 0) {
-            Logger.warning("kcp_client", "ikcp_send returned " + ret + " (queue may be full)");
-            return;
-        }
+        synchronized (kcpLock) {
+            int ret = kcp.send(data);
+            if (ret < 0) {
+                Logger.warning("kcp_client", "ikcp_send returned " + ret + " (queue may be full)");
+                return;
+            }
 
-        kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.flush();
+        }
     }
 
     /**
@@ -260,15 +273,20 @@ public class KcpClientSession {
             return;
         }
 
-        int peekSize = kcp.peekSize();
-        if (peekSize <= 0) {
-            return;
-        }
+        int peekSize;
+        int len;
+        byte[] buf;
+        synchronized (kcpLock) {
+            peekSize = kcp.peekSize();
+            if (peekSize <= 0) {
+                return;
+            }
 
-        byte[] buf = new byte[peekSize];
-        int len = kcp.recv(buf);
-        if (len <= 0) {
-            return;
+            buf = new byte[peekSize];
+            len = kcp.recv(buf);
+            if (len <= 0) {
+                return;
+            }
         }
 
         Consumer<byte[]> handler = pendingReadHandler;
