@@ -2,6 +2,7 @@ package com.example.kcpvpn.server;
 
 import com.example.kcpvpn.core.crypto.Crypto;
 import com.example.kcpvpn.core.crypto.CryptoConfig;
+import com.example.kcpvpn.core.protocol.KcpFrame;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
@@ -148,10 +149,6 @@ public class LocalKcpServer {
             }
         }
 
-        // 处理 SOCKS5 请求（如果握手未完成）
-        if (!session.isHandshakeDone() && !session.isSocks5ReadPending()) {
-            handleSocks5(session);
-        }
     }
 
     /**
@@ -178,6 +175,9 @@ public class LocalKcpServer {
             session.setSendCallback(data -> {
                 sendToClient(clientAddr, data);
             });
+            session.setFrameHandler(frame -> {
+                handleFrame(session, frame);
+            });
 
             session.start();
 
@@ -192,23 +192,25 @@ public class LocalKcpServer {
         }
     }
 
-    /**
-     * 处理 SOCKS5
-     */
-    private void handleSocks5(ServerSession session) {
-        session.setSocks5ReadPending(true);
+    private void handleFrame(ServerSession session, KcpFrame frame) {
+        long connectionId = frame.getConnectionId();
+        byte frameType = frame.getFrameType();
 
-        byte[] buffer = new byte[ServerConfig.FWD_BUF_SIZE];
-        session.asyncReadSome(buffer, data -> {
-            session.setSocks5ReadPending(false);
-
-            if (data == null || data.length == 0) {
-                Logger.warning(LogConfig.MODULE_KCP_SERVER, "SOCKS5 read error");
-                return;
-            }
-
-            Socks5Handler.handleRequest(session, data, connectionManager);
-        });
+        if (frameType == KcpFrame.TYPE_OPEN) {
+            Socks5Handler.handleOpenFrame(session, frame, connectionManager);
+        } else if (frameType == KcpFrame.TYPE_DATA) {
+            Logger.debug(LogConfig.MODULE_KCP_SERVER, "DATA frame: connectionId=" + connectionId
+                    + ", payloadLength=" + frame.getPayloadLength());
+            connectionManager.writeData(connectionId, frame.getPayload());
+        } else if (frameType == KcpFrame.TYPE_CLOSE) {
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "CLOSE frame: connectionId=" + connectionId
+                    + ", payloadLength=" + frame.getPayloadLength());
+            connectionManager.closeConnection(connectionId, false);
+        } else if (frameType == KcpFrame.TYPE_RESET) {
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "RESET frame: connectionId=" + connectionId
+                    + ", payloadLength=" + frame.getPayloadLength());
+            connectionManager.closeConnection(connectionId, true);
+        }
     }
 
     /**
@@ -244,7 +246,7 @@ public class LocalKcpServer {
                         if (!session.isAlive()) {
                             Logger.info(LogConfig.MODULE_KCP_SERVER, "Cleaning up dead session: " + entry.getKey());
                             session.stop();
-                            connectionManager.closeConnection(entry.getKey());
+                            connectionManager.closeSessionConnections(entry.getKey());
                             sessions.remove(entry.getKey());
                         }
                     }

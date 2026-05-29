@@ -240,8 +240,8 @@ public class KcpVpnService extends VpnService {
                 broadcastState();
                 updateNotification();
             });
-            tunnelManager.setDataReceivedCallback(data -> {
-                handleInboundData(data);
+            tunnelManager.setFrameReceivedCallback(frame -> {
+                handleInboundFrame(frame);
             });
 
             // 创建数据包路由器
@@ -263,11 +263,11 @@ public class KcpVpnService extends VpnService {
 
             Logger.info(LogConfig.MODULE_VPN, "Tunnel connected successfully");
 
-            // 启动读取线程
-            startVpnReadThread();
-
             running = true;
             connectionStartTime = System.currentTimeMillis();
+
+            // 启动读取线程
+            startVpnReadThread();
 
             // 不重复设 CONNECTED，tunnelManager 的回调已经设过了
             Logger.info(LogConfig.MODULE_VPN, "VPN started successfully");
@@ -301,11 +301,23 @@ public class KcpVpnService extends VpnService {
 
                         // 处理出站数据包
                         packetRouter.handleOutboundPacket(packet,
-                                new PacketRouter.SendDataCallback() {
+                                new PacketRouter.SendFrameCallback() {
                                     @Override
-                                    public void onSendData(byte[] data) {
-                                        tunnelManager.sendData(data);
-                                        uploadBytes += data.length;
+                                    public void onSendFrame(com.example.kcpvpn.core.protocol.KcpFrame frame) {
+                                        tunnelManager.sendFrame(frame);
+                                        uploadBytes += frame.getPayloadLength();
+                                    }
+                                },
+                                new PacketRouter.WritePacketCallback() {
+                                    @Override
+                                    public void onWritePacket(byte[] packet) {
+                                        try {
+                                            writeToVpn(packet);
+                                            downloadBytes += packet.length;
+                                            Logger.debug(LogConfig.MODULE_VPN, "VPN write: " + packet.length + " bytes");
+                                        } catch (IOException e) {
+                                            Logger.error(LogConfig.MODULE_VPN, "VPN write error: " + e.getMessage());
+                                        }
                                     }
                                 });
 
@@ -326,18 +338,17 @@ public class KcpVpnService extends VpnService {
     /**
      * 处理入站数据
      */
-    private void handleInboundData(byte[] data) {
+    private void handleInboundFrame(com.example.kcpvpn.core.protocol.KcpFrame frame) {
         if (!running || vpnOutputChannel == null) {
             return;
         }
 
-        packetRouter.handleInboundData(data,
+        packetRouter.handleInboundFrame(frame,
                 new PacketRouter.WritePacketCallback() {
                     @Override
                     public void onWritePacket(byte[] packet) {
                         try {
-                            ByteBuffer buffer = ByteBuffer.wrap(packet);
-                            vpnOutputChannel.write(buffer);
+                            writeToVpn(packet);
                             downloadBytes += packet.length;
 
                             Logger.debug(LogConfig.MODULE_VPN, "VPN write: " + packet.length + " bytes");
@@ -346,6 +357,11 @@ public class KcpVpnService extends VpnService {
                         }
                     }
                 });
+    }
+
+    private synchronized void writeToVpn(byte[] packet) throws IOException {
+        ByteBuffer buffer = ByteBuffer.wrap(packet);
+        vpnOutputChannel.write(buffer);
     }
 
     /**

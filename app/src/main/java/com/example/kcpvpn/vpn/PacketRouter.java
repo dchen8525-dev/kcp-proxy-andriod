@@ -1,96 +1,80 @@
 package com.example.kcpvpn.vpn;
 
-import com.example.kcpvpn.core.protocol.AddressParser;
-import com.example.kcpvpn.core.protocol.Socks5;
+import com.example.kcpvpn.core.protocol.KcpFrame;
 import com.example.kcpvpn.core.protocol.Socks5Request;
-import com.example.kcpvpn.core.protocol.Socks5Response;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 数据包路由器 - 处理 VPN 数据包与 SOCKS5/KCP 的转换
+ * 数据包路由器 - 处理 VPN 数据包与 KCP frame 的转换
  */
 public class PacketRouter {
 
-    private final Map<Integer, SocketConnection> connections;
+    private final Map<String, TcpConnection> connectionsByKey;
+    private final Map<Long, TcpConnection> connectionsById;
+    private final AtomicLong nextConnectionId;
+    private final AtomicLong nextTcpSequence;
     private volatile boolean running;
 
     public PacketRouter() {
-        this.connections = new ConcurrentHashMap<>();
+        this.connectionsByKey = new ConcurrentHashMap<>();
+        this.connectionsById = new ConcurrentHashMap<>();
+        this.nextConnectionId = new AtomicLong(System.currentTimeMillis());
+        this.nextTcpSequence = new AtomicLong(System.nanoTime());
         this.running = false;
     }
 
-    /**
-     * 启动路由器
-     */
     public void start() {
         running = true;
         Logger.info(LogConfig.MODULE_VPN, "PacketRouter started");
     }
 
-    /**
-     * 停止路由器
-     */
     public void stop() {
         running = false;
 
-        // 关闭所有连接
-        for (SocketConnection conn : connections.values()) {
+        for (TcpConnection conn : connectionsById.values()) {
             conn.close();
         }
-        connections.clear();
+        connectionsByKey.clear();
+        connectionsById.clear();
 
         Logger.info(LogConfig.MODULE_VPN, "PacketRouter stopped");
     }
 
-    /**
-     * 生成连接 key — 使用 IP 字节数组 + 端口，避免 hashCode 碰撞
-     */
-    private static int connectionKey(byte[] dstAddr, int dstPort) {
-        return Arrays.hashCode(dstAddr) * 31 + dstPort;
+    private static String connectionKey(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort) {
+        return addressToString(srcAddr) + ":" + srcPort + "->" + addressToString(dstAddr) + ":" + dstPort;
     }
 
-    /**
-     * 处理出站数据包（从 VPN 接口读取，通过 KCP 发送）
-     * @param packet IP 数据包
-     * @param sendDataCallback 发送数据回调
-     */
-    public void handleOutboundPacket(byte[] packet, SendDataCallback sendDataCallback) {
+    public void handleOutboundPacket(byte[] packet, SendFrameCallback sendFrameCallback,
+                                     WritePacketCallback writePacketCallback) {
         if (!running || packet == null || packet.length < 20) {
             return;
         }
 
         try {
-            // 解析 IP 包头
-            ByteBuffer buf = ByteBuffer.wrap(packet);
+            ByteBuffer buf = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN);
 
-            byte version = (byte) ((buf.get() >> 4) & 0x0F);
+            int version = (buf.get(0) >> 4) & 0x0F;
             if (version != 4) {
                 Logger.debug(LogConfig.MODULE_VPN, "Ignoring non-IPv4 packet");
                 return;
             }
 
-            buf.position(0);
+            int ihl = buf.get(0) & 0x0F;
+            int ipHeaderLen = ihl * 4;
+            if (packet.length < ipHeaderLen + 20) {
+                return;
+            }
 
-            // 解析 IP 头
-            byte ihl = (byte) (buf.get() & 0x0F);
-            int headerLen = ihl * 4;
-
-            buf.get();  // TOS
-            int totalLen = buf.getShort() & 0xFFFF;
-            buf.getShort();  // ID
-            int flagsAndFragment = buf.getShort() & 0xFFFF;
-
-            // 检查是否分片（MF=1 或 Fragment Offset != 0）
+            int totalLen = buf.getShort(2) & 0xFFFF;
+            int flagsAndFragment = buf.getShort(6) & 0xFFFF;
             int moreFragments = flagsAndFragment & 0x2000;
             int fragmentOffset = (flagsAndFragment & 0x1FFF) << 3;
             if (moreFragments != 0 || fragmentOffset != 0) {
@@ -98,214 +82,287 @@ public class PacketRouter {
                 return;
             }
 
-            buf.get();  // TTL
-            byte protocol = buf.get();
-            buf.getShort();  // Checksum
-
-            byte[] srcAddr = new byte[4];
-            buf.get(srcAddr);
-
-            byte[] dstAddr = new byte[4];
-            buf.get(dstAddr);
-
-            // 校验 totalLen 不超过实际数据长度
-            if (totalLen > packet.length) {
-                totalLen = packet.length;
-            }
-
-            // 解析目标地址和端口
-            int dstPort = 0;
-            int srcPort = 0;
-
-            if (protocol == 6) {  // TCP
-                buf.position(headerLen);
-                srcPort = buf.getShort() & 0xFFFF;
-                dstPort = buf.getShort() & 0xFFFF;
-            } else if (protocol == 17) {  // UDP
-                buf.position(headerLen);
-                srcPort = buf.getShort() & 0xFFFF;
-                dstPort = buf.getShort() & 0xFFFF;
-            } else {
-                Logger.debug(LogConfig.MODULE_VPN, "Ignoring non-TCP/UDP packet: protocol=" + protocol);
+            byte protocol = buf.get(9);
+            if (protocol != 6) {
+                Logger.debug(LogConfig.MODULE_VPN, "Ignoring non-TCP packet: protocol=" + protocol);
                 return;
             }
 
-            // 构建目标地址字符串
-            String dstHost = String.format("%d.%d.%d.%d",
-                    dstAddr[0] & 0xFF, dstAddr[1] & 0xFF,
-                    dstAddr[2] & 0xFF, dstAddr[3] & 0xFF);
+            if (totalLen <= 0 || totalLen > packet.length) {
+                totalLen = packet.length;
+            }
 
-            Logger.debug(LogConfig.MODULE_VPN, "Outbound: " + dstHost + ":" + dstPort
-                    + " (" + (protocol == 6 ? "TCP" : "UDP") + ")");
+            byte[] srcAddr = Arrays.copyOfRange(packet, 12, 16);
+            byte[] dstAddr = Arrays.copyOfRange(packet, 16, 20);
+            int tcpOffset = ipHeaderLen;
+            int srcPort = buf.getShort(tcpOffset) & 0xFFFF;
+            int dstPort = buf.getShort(tcpOffset + 2) & 0xFFFF;
+            int clientSeq = buf.getInt(tcpOffset + 4);
+            int tcpHeaderLen = ((buf.get(tcpOffset + 12) >> 4) & 0x0F) * 4;
+            int flags = buf.get(tcpOffset + 13) & 0xFF;
+            int payloadOffset = tcpOffset + tcpHeaderLen;
+            int payloadLen = totalLen - payloadOffset;
+            if (payloadLen < 0) {
+                return;
+            }
 
-            // 获取或创建连接（使用 IP 字节+端口作为 key）
-            int connKey = connectionKey(dstAddr, dstPort);
-            SocketConnection conn = connections.get(connKey);
-
+            String key = connectionKey(srcAddr, srcPort, dstAddr, dstPort);
+            TcpConnection conn = connectionsByKey.get(key);
             if (conn == null) {
-                // 创建新连接
-                conn = new SocketConnection(dstHost, dstPort, sendDataCallback);
-                connections.put(connKey, conn);
+                conn = new TcpConnection(nextConnectionId.incrementAndGet(), key, srcAddr, srcPort,
+                        dstAddr, dstPort, (int) nextTcpSequence.addAndGet(0x10000L));
+                connectionsByKey.put(key, conn);
+                connectionsById.put(conn.connectionId, conn);
 
-                // 发送 SOCKS5 CONNECT 请求
-                byte[] socks5Request = Socks5Request.buildConnectRequest(dstHost, dstPort);
-                sendDataCallback.onSendData(socks5Request);
-
-                Logger.info(LogConfig.MODULE_SOCKS5, "New connection: " + dstHost + ":" + dstPort);
+                byte[] openPayload = Socks5Request.buildConnectRequest(conn.dstHost, conn.dstPort);
+                sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_OPEN, conn.connectionId, openPayload));
+                Logger.info(LogConfig.MODULE_VPN, "OPEN frame: connectionId=" + conn.connectionId
+                        + ", src=" + conn.srcHost + ":" + conn.srcPort
+                        + ", dst=" + conn.dstHost + ":" + conn.dstPort
+                        + ", payloadLength=" + openPayload.length);
             }
 
-            // 提取数据部分
-            int transportHeaderLen;
-            if (protocol == 6) {
-                // TCP: 从 TCP 头起始位置读 data offset
-                // 当前 buf 位置在 srcPort(2)+dstPort(2) 之后，即 TCP 偏移 4
-                // 还需跳过 seq(4)+ack(4)+dataOffset+flags(2) = 10 字节才能读到 data offset 字段
-                // 但 data offset 在 TCP 头第 13 字节的高 4 位
-                // 更简单的方法：回到 TCP 头起始读 data offset
-                int savedPos = buf.position();
-                buf.position(headerLen + 12);  // TCP 头偏移 12 = data offset 字段
-                byte dataOffsetByte = buf.get();
-                transportHeaderLen = ((dataOffsetByte >> 4) & 0x0F) * 4;
-                buf.position(savedPos);  // 恢复位置
-            } else {
-                // UDP 头固定 8 字节
-                transportHeaderLen = 8;
+            if ((flags & 0x02) != 0) {
+                synchronized (conn) {
+                    conn.clientNextSeq = clientSeq + 1;
+                    byte[] synAck = buildTcpPacket(conn, new byte[0], (byte) 0x12,
+                            conn.serverInitialSeq, conn.clientNextSeq);
+                    writePacketCallback.onWritePacket(synAck);
+                    if (!conn.synAckSent) {
+                        conn.serverNextSeq = conn.serverInitialSeq + 1;
+                        conn.synAckSent = true;
+                    }
+                }
+                Logger.debug(LogConfig.MODULE_VPN, "TCP SYN-ACK: connectionId=" + conn.connectionId
+                        + ", src=" + conn.dstHost + ":" + conn.dstPort
+                        + ", dst=" + conn.srcHost + ":" + conn.srcPort + ", payloadLength=0");
+                return;
             }
 
-            int dataLen = totalLen - headerLen - transportHeaderLen;
-
-            if (dataLen > 0 && conn.isHandshakeDone()) {
-                byte[] data = new byte[dataLen];
-                buf.position(headerLen + transportHeaderLen);
-                buf.get(data);
-
-                sendDataCallback.onSendData(data);
-                Logger.debug(LogConfig.MODULE_VPN, "Sent " + dataLen + " bytes");
+            if ((flags & 0x04) != 0) {
+                sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_RESET, conn.connectionId, null));
+                byte[] rstAck = buildTcpPacket(conn, new byte[0], (byte) 0x14,
+                        conn.serverNextSeq, clientSeq + 1);
+                writePacketCallback.onWritePacket(rstAck);
+                Logger.info(LogConfig.MODULE_VPN, "RESET frame: connectionId=" + conn.connectionId
+                        + ", src=" + conn.srcHost + ":" + conn.srcPort
+                        + ", dst=" + conn.dstHost + ":" + conn.dstPort + ", payloadLength=0");
+                removeConnection(conn);
+                return;
             }
 
+            if (payloadLen > 0) {
+                byte[] payload = new byte[payloadLen];
+                System.arraycopy(packet, payloadOffset, payload, 0, payloadLen);
+                synchronized (conn) {
+                    conn.clientNextSeq = clientSeq + payloadLen;
+                }
+                sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_DATA, conn.connectionId, payload));
+                byte[] ack = buildTcpPacket(conn, new byte[0], (byte) 0x10,
+                        conn.serverNextSeq, conn.clientNextSeq);
+                writePacketCallback.onWritePacket(ack);
+                Logger.debug(LogConfig.MODULE_VPN, "DATA frame: connectionId=" + conn.connectionId
+                        + ", src=" + conn.srcHost + ":" + conn.srcPort
+                        + ", dst=" + conn.dstHost + ":" + conn.dstPort
+                        + ", payloadLength=" + payloadLen);
+            }
+
+            if ((flags & 0x01) != 0) {
+                synchronized (conn) {
+                    conn.clientNextSeq = clientSeq + payloadLen + 1;
+                }
+                sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_CLOSE, conn.connectionId, null));
+                byte[] finAck = buildTcpPacket(conn, new byte[0], (byte) 0x11,
+                        conn.serverNextSeq, conn.clientNextSeq);
+                writePacketCallback.onWritePacket(finAck);
+                synchronized (conn) {
+                    conn.serverNextSeq += 1;
+                }
+                Logger.info(LogConfig.MODULE_VPN, "CLOSE frame: connectionId=" + conn.connectionId
+                        + ", src=" + conn.srcHost + ":" + conn.srcPort
+                        + ", dst=" + conn.dstHost + ":" + conn.dstPort + ", payloadLength=0");
+                removeConnection(conn);
+            }
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "Handle outbound error: " + e.getMessage());
         }
     }
 
-    /**
-     * 处理入站数据包（从 KCP 接收，写入 VPN 接口）
-     * @param data 数据
-     * @param writePacketCallback 写入回调
-     */
-    public void handleInboundData(byte[] data, WritePacketCallback writePacketCallback) {
-        if (!running || data == null || data.length == 0) {
+    public void handleInboundFrame(KcpFrame frame, WritePacketCallback writePacketCallback) {
+        if (!running || frame == null) {
             return;
         }
 
-        // 检查是否是 SOCKS5 响应
-        if (data.length >= 2 && data[0] == Socks5.SOCKS5_VERSION) {
-            Socks5Response response = Socks5Response.parse(data, 0, data.length);
-            if (response.reply == Socks5.SOCKS5_REPLY_SUCCEEDED) {
-                Logger.info(LogConfig.MODULE_SOCKS5, "SOCKS5 handshake success");
-                // 只标记最近创建的未握手连接（而非所有连接）
-                for (SocketConnection conn : connections.values()) {
-                    if (!conn.isHandshakeDone()) {
-                        conn.markHandshakeDone();
-                    }
-                }
-            } else {
-                Logger.warning(LogConfig.MODULE_SOCKS5, "SOCKS5 handshake failed: " + response.reply);
-            }
+        TcpConnection conn = connectionsById.get(frame.getConnectionId());
+        if (conn == null) {
+            Logger.warning(LogConfig.MODULE_VPN, "Dropping frame for unknown connectionId="
+                    + frame.getConnectionId() + ", frameType="
+                    + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
+                    + frame.getPayloadLength());
             return;
         }
 
-        // 构建返回的 IP 数据包
         try {
-            byte[] ipPacket = buildIpPacket(data);
-            writePacketCallback.onWritePacket(ipPacket);
-            Logger.debug(LogConfig.MODULE_VPN, "Inbound: " + data.length + " bytes -> VPN");
+            if (frame.getFrameType() == KcpFrame.TYPE_DATA) {
+                byte[] ipPacket;
+                synchronized (conn) {
+                    ipPacket = buildTcpPacket(conn, frame.getPayload(), (byte) 0x18,
+                            conn.serverNextSeq, conn.clientNextSeq);
+                    conn.serverNextSeq += frame.getPayloadLength();
+                }
+                writePacketCallback.onWritePacket(ipPacket);
+                Logger.debug(LogConfig.MODULE_VPN, "Inbound DATA: connectionId=" + conn.connectionId
+                        + ", src=" + conn.dstHost + ":" + conn.dstPort
+                        + ", dst=" + conn.srcHost + ":" + conn.srcPort
+                        + ", payloadLength=" + frame.getPayloadLength());
+            } else if (frame.getFrameType() == KcpFrame.TYPE_CLOSE) {
+                byte[] finAck;
+                synchronized (conn) {
+                    finAck = buildTcpPacket(conn, new byte[0], (byte) 0x11,
+                            conn.serverNextSeq, conn.clientNextSeq);
+                    conn.serverNextSeq += 1;
+                }
+                writePacketCallback.onWritePacket(finAck);
+                Logger.info(LogConfig.MODULE_VPN, "Inbound CLOSE: connectionId=" + conn.connectionId
+                        + ", src=" + conn.dstHost + ":" + conn.dstPort
+                        + ", dst=" + conn.srcHost + ":" + conn.srcPort + ", payloadLength=0");
+                removeConnection(conn);
+            } else if (frame.getFrameType() == KcpFrame.TYPE_RESET) {
+                byte[] rst;
+                synchronized (conn) {
+                    rst = buildTcpPacket(conn, new byte[0], (byte) 0x14,
+                            conn.serverNextSeq, conn.clientNextSeq);
+                }
+                writePacketCallback.onWritePacket(rst);
+                Logger.info(LogConfig.MODULE_VPN, "Inbound RESET: connectionId=" + conn.connectionId
+                        + ", src=" + conn.dstHost + ":" + conn.dstPort
+                        + ", dst=" + conn.srcHost + ":" + conn.srcPort + ", payloadLength=0");
+                removeConnection(conn);
+            }
         } catch (Exception e) {
-            Logger.error(LogConfig.MODULE_VPN, "Build IP packet error: " + e.getMessage());
+            Logger.error(LogConfig.MODULE_VPN, "Build inbound packet error: " + e.getMessage());
         }
     }
 
-    /**
-     * 构建 IP 数据包
-     * TODO: 需要维护连接状态（源/目的地址、端口、序列号）才能正确构建
-     */
-    private byte[] buildIpPacket(byte[] payload) {
-        int totalLen = 20 + 20 + payload.length;  // IP header + TCP header + payload
-        ByteBuffer buf = ByteBuffer.allocate(totalLen);
+    private void removeConnection(TcpConnection conn) {
+        conn.close();
+        connectionsByKey.remove(conn.key);
+        connectionsById.remove(conn.connectionId);
+    }
 
-        // IP header (20 bytes)
-        buf.put((byte) 0x45);  // Version 4, IHL 5
-        buf.put((byte) 0);     // TOS
+    private byte[] buildTcpPacket(TcpConnection conn, byte[] payload, byte tcpFlags, int seq, int ack) {
+        int totalLen = 20 + 20 + payload.length;
+        byte[] packet = new byte[totalLen];
+        ByteBuffer buf = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN);
+
+        buf.put((byte) 0x45);
+        buf.put((byte) 0);
         buf.putShort((short) totalLen);
-        buf.putShort((short) 0);  // ID
-        buf.putShort((short) 0x4000);  // Flags (Don't Fragment)
-        buf.put((byte) 64);    // TTL
-        buf.put((byte) 6);     // Protocol (TCP)
-        buf.putShort((short) 0);  // Checksum (placeholder)
+        buf.putShort((short) 0);
+        buf.putShort((short) 0x4000);
+        buf.put((byte) 64);
+        buf.put((byte) 6);
+        buf.putShort((short) 0);
+        buf.put(conn.dstAddr);
+        buf.put(conn.srcAddr);
 
-        // Source address (10.0.0.2 - VPN 内部地址)
-        buf.put(new byte[]{10, 0, 0, 2});
-
-        // Destination address (TODO: 需要根据实际连接确定)
-        buf.put(new byte[]{0, 0, 0, 0});
-
-        // TCP header (20 bytes, minimal)
-        buf.putShort((short) 0);  // Source port
-        buf.putShort((short) 0);  // Destination port
-        buf.putInt(0);  // Sequence number
-        buf.putInt(0);  // Ack number
-        buf.put((byte) 0x50);  // Data offset (5)
-        buf.put((byte) 0);     // Flags
-        buf.putShort((short) 0);  // Window
-        buf.putShort((short) 0);  // Checksum
-        buf.putShort((short) 0);  // Urgent pointer
-
-        // Payload
+        buf.putShort((short) conn.dstPort);
+        buf.putShort((short) conn.srcPort);
+        buf.putInt(seq);
+        buf.putInt(ack);
+        buf.put((byte) 0x50);
+        buf.put(tcpFlags);
+        buf.putShort((short) 65535);
+        buf.putShort((short) 0);
+        buf.putShort((short) 0);
         buf.put(payload);
 
-        return buf.array();
+        putChecksum(packet, 10, checksum(packet, 0, 20));
+        putChecksum(packet, 36, tcpChecksum(packet, 20, 20 + payload.length, conn.dstAddr, conn.srcAddr));
+        return packet;
     }
 
-    /**
-     * 发送数据回调接口
-     */
-    public interface SendDataCallback {
-        void onSendData(byte[] data);
+    private static int tcpChecksum(byte[] packet, int offset, int len, byte[] srcAddr, byte[] dstAddr) {
+        byte[] pseudo = new byte[12 + len];
+        System.arraycopy(srcAddr, 0, pseudo, 0, 4);
+        System.arraycopy(dstAddr, 0, pseudo, 4, 4);
+        pseudo[8] = 0;
+        pseudo[9] = 6;
+        pseudo[10] = (byte) ((len >> 8) & 0xFF);
+        pseudo[11] = (byte) (len & 0xFF);
+        System.arraycopy(packet, offset, pseudo, 12, len);
+        return checksum(pseudo, 0, pseudo.length);
     }
 
-    /**
-     * 写入数据包回调接口
-     */
+    private static int checksum(byte[] data, int offset, int len) {
+        long sum = 0;
+        int i = offset;
+        while (len > 1) {
+            sum += ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+            i += 2;
+            len -= 2;
+        }
+        if (len > 0) {
+            sum += (data[i] & 0xFF) << 8;
+        }
+        while ((sum >> 16) != 0) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        return (int) (~sum) & 0xFFFF;
+    }
+
+    private static void putChecksum(byte[] packet, int offset, int checksum) {
+        packet[offset] = (byte) ((checksum >> 8) & 0xFF);
+        packet[offset + 1] = (byte) (checksum & 0xFF);
+    }
+
+    private static String addressToString(byte[] addr) {
+        return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
+                + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+    }
+
+    public interface SendFrameCallback {
+        void onSendFrame(KcpFrame frame);
+    }
+
     public interface WritePacketCallback {
         void onWritePacket(byte[] packet);
     }
 
-    /**
-     * Socket 连接状态
-     */
-    private static class SocketConnection {
-        private final String host;
-        private final int port;
-        private final SendDataCallback sendCallback;
-        private volatile boolean handshakeDone;
+    private static class TcpConnection {
+        private final long connectionId;
+        private final String key;
+        private final byte[] srcAddr;
+        private final byte[] dstAddr;
+        private final int srcPort;
+        private final int dstPort;
+        private final String srcHost;
+        private final String dstHost;
+        private final int serverInitialSeq;
+        private int clientNextSeq;
+        private int serverNextSeq;
+        private boolean synAckSent;
+        private volatile boolean closed;
 
-        public SocketConnection(String host, int port, SendDataCallback sendCallback) {
-            this.host = host;
-            this.port = port;
-            this.sendCallback = sendCallback;
-            this.handshakeDone = false;
+        TcpConnection(long connectionId, String key, byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
+                      int initialServerSeq) {
+            this.connectionId = connectionId;
+            this.key = key;
+            this.srcAddr = Arrays.copyOf(srcAddr, srcAddr.length);
+            this.dstAddr = Arrays.copyOf(dstAddr, dstAddr.length);
+            this.srcPort = srcPort;
+            this.dstPort = dstPort;
+            this.srcHost = addressToString(srcAddr);
+            this.dstHost = addressToString(dstAddr);
+            this.serverInitialSeq = initialServerSeq;
+            this.clientNextSeq = 0;
+            this.serverNextSeq = initialServerSeq;
+            this.synAckSent = false;
+            this.closed = false;
         }
 
-        public void markHandshakeDone() {
-            handshakeDone = true;
-        }
-
-        public boolean isHandshakeDone() {
-            return handshakeDone;
-        }
-
-        public void close() {
-            // 清理连接资源
+        void close() {
+            closed = true;
         }
     }
 }

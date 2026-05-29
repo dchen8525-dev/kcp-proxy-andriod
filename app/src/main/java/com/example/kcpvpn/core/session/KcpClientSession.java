@@ -4,20 +4,17 @@ import com.example.kcpvpn.core.crypto.Crypto;
 import com.example.kcpvpn.core.kcp.Kcp;
 import com.example.kcpvpn.core.kcp.KcpConfig;
 import com.example.kcpvpn.core.kcp.KcpOutputCallback;
-import com.example.kcpvpn.core.protocol.AddressEncoder;
-import com.example.kcpvpn.core.protocol.Socks5;
-import com.example.kcpvpn.core.protocol.Socks5Request;
-import com.example.kcpvpn.core.protocol.Socks5Response;
+import com.example.kcpvpn.core.protocol.KcpFrame;
+import com.example.kcpvpn.core.protocol.KcpFrameCodec;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -31,32 +28,30 @@ public class KcpClientSession {
     private final InetSocketAddress serverAddr;
     private final Crypto crypto;
     private final Kcp kcp;
+    private final Object kcpLock;
+    private final KcpFrameCodec frameCodec;
 
     private DatagramSocket udpSocket;
     private volatile boolean running;
     private volatile boolean connected;
-    private volatile boolean handshakeDone;
 
     private final AtomicLong lastActivityTime;
 
     private Thread updateThread;
     private Thread recvThread;
 
-    // pendingRead 字段使用 volatile 保证跨线程可见性
-    private volatile byte[] pendingReadBuffer;
-    private volatile Consumer<byte[]> pendingReadHandler;
-
-    private volatile Consumer<byte[]> onDataReceived;
+    private volatile Consumer<KcpFrame> onFrameReceived;
 
     public KcpClientSession(String serverHost, int serverPort, Crypto crypto) {
         this.sessionId = "client-" + System.currentTimeMillis();
         this.serverAddr = new InetSocketAddress(serverHost, serverPort);
         this.crypto = crypto;
         this.kcp = new Kcp(KcpConfig.DEFAULT_CONV);
+        this.kcpLock = new Object();
+        this.frameCodec = new KcpFrameCodec(LogConfig.MODULE_KCP_CLIENT);
 
         this.running = false;
         this.connected = false;
-        this.handshakeDone = false;
         this.lastActivityTime = new AtomicLong(System.currentTimeMillis());
 
         // 配置 KCP
@@ -89,7 +84,6 @@ public class KcpClientSession {
 
             running = true;
             connected = true;
-            handshakeDone = false;  // 重置握手状态
             touchActivity();
 
             startUpdateThread();
@@ -113,8 +107,9 @@ public class KcpClientSession {
             while (running) {
                 try {
                     long nowMs = System.currentTimeMillis();
-                    kcp.update((int) (nowMs & 0xFFFFFFFFL));
-                    tryFulfillRead();
+                    synchronized (kcpLock) {
+                        kcp.update((int) (nowMs & 0xFFFFFFFFL));
+                    }
                     Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     break;
@@ -161,7 +156,10 @@ public class KcpClientSession {
             byte[] decrypted = crypto.decrypt(encryptedData);
             touchActivity();
 
-            int ret = kcp.input(decrypted);
+            int ret;
+            synchronized (kcpLock) {
+                ret = kcp.input(decrypted);
+            }
             if (ret < 0) {
                 Logger.warning("kcp_client", "ikcp_input rejected packet, ret=" + ret);
                 return;
@@ -178,20 +176,31 @@ public class KcpClientSession {
      * 尝试将 KCP 接收的数据直接交付给回调
      */
     private void tryDeliverData() {
-        Consumer<byte[]> cb = onDataReceived;
+        Consumer<KcpFrame> cb = onFrameReceived;
         if (cb == null) return;
 
         while (true) {
-            int peekSize = kcp.peekSize();
-            if (peekSize <= 0) break;
+            byte[] data;
+            synchronized (kcpLock) {
+                int peekSize = kcp.peekSize();
+                if (peekSize <= 0) break;
 
-            byte[] buf = new byte[peekSize];
-            int len = kcp.recv(buf);
-            if (len <= 0) break;
+                byte[] buf = new byte[peekSize];
+                int len = kcp.recv(buf);
+                if (len <= 0) break;
 
-            byte[] data = new byte[len];
-            System.arraycopy(buf, 0, data, 0, len);
-            cb.accept(data);
+                data = new byte[len];
+                System.arraycopy(buf, 0, data, 0, len);
+            }
+
+            List<KcpFrame> frames = frameCodec.decode(data);
+            for (KcpFrame frame : frames) {
+                Logger.debug(LogConfig.MODULE_KCP_CLIENT, "Recv frame: connectionId="
+                        + frame.getConnectionId() + ", frameType="
+                        + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
+                        + frame.getPayloadLength());
+                cb.accept(frame);
+            }
         }
     }
 
@@ -212,94 +221,33 @@ public class KcpClientSession {
         }
     }
 
-    /**
-     * 发送数据 — 不因单次 KCP send 失败而关闭整个 session
-     */
-    public void sendData(byte[] data) {
+    public void sendFrame(KcpFrame frame) {
         if (!running || !connected) {
             return;
         }
 
-        int ret = kcp.send(data);
-        if (ret < 0) {
-            Logger.warning("kcp_client", "ikcp_send returned " + ret + " (queue may be full)");
-            return;
+        byte[] data = KcpFrameCodec.encode(frame);
+        synchronized (kcpLock) {
+            int ret = kcp.send(data);
+            if (ret < 0) {
+                Logger.warning("kcp_client", "ikcp_send returned " + ret + " (queue may be full)");
+                return;
+            }
+
+            kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
         }
 
-        kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
-    }
-
-    /**
-     * 发送 SOCKS5 CONNECT 请求
-     */
-    public boolean sendSocks5Request(String host, int port) {
-        byte[] request = Socks5Request.buildConnectRequest(host, port);
-        sendData(request);
-        return running && connected;  // 返回实际状态
-    }
-
-    /**
-     * 异步读取数据 — synchronized 防止与 tryFulfillRead 竞态
-     */
-    public synchronized void asyncReadSome(byte[] buffer, Consumer<byte[]> handler) {
-        if (!running) {
-            handler.accept(null);
-            return;
-        }
-
-        pendingReadBuffer = buffer;
-        pendingReadHandler = handler;
-        tryFulfillRead();
-    }
-
-    /**
-     * 尝试读取数据
-     */
-    private synchronized void tryFulfillRead() {
-        if (pendingReadBuffer == null || pendingReadHandler == null) {
-            return;
-        }
-
-        int peekSize = kcp.peekSize();
-        if (peekSize <= 0) {
-            return;
-        }
-
-        byte[] buf = new byte[peekSize];
-        int len = kcp.recv(buf);
-        if (len <= 0) {
-            return;
-        }
-
-        Consumer<byte[]> handler = pendingReadHandler;
-        pendingReadBuffer = null;
-        pendingReadHandler = null;
-
-        byte[] data = new byte[len];
-        System.arraycopy(buf, 0, data, 0, len);
-
-        handler.accept(data);
+        Logger.debug(LogConfig.MODULE_KCP_CLIENT, "Sent frame: connectionId="
+                + frame.getConnectionId() + ", frameType="
+                + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
+                + frame.getPayloadLength());
     }
 
     /**
      * 设置数据接收回调
      */
-    public void setOnDataReceived(Consumer<byte[]> callback) {
-        this.onDataReceived = callback;
-    }
-
-    /**
-     * 标记握手完成
-     */
-    public void markHandshakeDone() {
-        handshakeDone = true;
-    }
-
-    /**
-     * 检查握手是否完成
-     */
-    public boolean isHandshakeDone() {
-        return handshakeDone;
+    public void setOnFrameReceived(Consumer<KcpFrame> callback) {
+        this.onFrameReceived = callback;
     }
 
     /**
@@ -333,7 +281,6 @@ public class KcpClientSession {
         if (!running) return;
         running = false;
         connected = false;
-        handshakeDone = false;  // 重置握手状态
 
         Logger.info("kcp_client", "Closing session: " + sessionId);
 
@@ -353,14 +300,6 @@ public class KcpClientSession {
         if (udpSocket != null) {
             udpSocket.close();
             udpSocket = null;
-        }
-
-        // 清理等待的读取
-        Consumer<byte[]> handler = pendingReadHandler;
-        if (handler != null) {
-            pendingReadHandler = null;
-            pendingReadBuffer = null;
-            handler.accept(null);
         }
 
         Logger.info("kcp_client", "Session closed: " + sessionId);

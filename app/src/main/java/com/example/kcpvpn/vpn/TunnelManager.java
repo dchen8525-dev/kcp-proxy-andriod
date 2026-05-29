@@ -1,6 +1,7 @@
 package com.example.kcpvpn.vpn;
 
 import com.example.kcpvpn.core.crypto.Crypto;
+import com.example.kcpvpn.core.protocol.KcpFrame;
 import com.example.kcpvpn.core.session.KcpClientSession;
 import com.example.kcpvpn.core.session.SessionConfig;
 import com.example.kcpvpn.log.LogConfig;
@@ -40,7 +41,7 @@ public class TunnelManager {
 
     // 状态回调
     private volatile Consumer<VpnConnectionState> stateCallback;
-    private volatile Consumer<byte[]> dataReceivedCallback;
+    private volatile Consumer<KcpFrame> frameReceivedCallback;
 
     public TunnelManager(String serverHost, int serverPort, String key) {
         this.serverHost = serverHost;
@@ -65,8 +66,8 @@ public class TunnelManager {
     /**
      * 设置数据接收回调
      */
-    public void setDataReceivedCallback(Consumer<byte[]> callback) {
-        this.dataReceivedCallback = callback;
+    public void setFrameReceivedCallback(Consumer<KcpFrame> callback) {
+        this.frameReceivedCallback = callback;
     }
 
     /**
@@ -94,12 +95,12 @@ public class TunnelManager {
             session = new KcpClientSession(serverHost, serverPort, crypto);
             Logger.info(LogConfig.MODULE_VPN, "KcpClientSession created");
 
-            session.setOnDataReceived(data -> {
-                Consumer<byte[]> cb = dataReceivedCallback;
+            session.setOnFrameReceived(frame -> {
+                Consumer<KcpFrame> cb = frameReceivedCallback;
                 if (cb != null) {
-                    cb.accept(data);
+                    cb.accept(frame);
                 }
-                downloadBytes.addAndGet(data.length);
+                downloadBytes.addAndGet(frame.getPayloadLength());
             });
 
             // 连接
@@ -136,39 +137,25 @@ public class TunnelManager {
     /**
      * 发送数据
      */
-    public void sendData(byte[] data) {
+    public void sendFrame(KcpFrame frame) {
         if (!running) {
-            Logger.warning(LogConfig.MODULE_VPN, "Not connected, cannot send data");
+            Logger.warning(LogConfig.MODULE_VPN, "Not connected, cannot send frame");
             return;
         }
 
         KcpClientSession s = session;
         if (s == null) {
-            Logger.warning(LogConfig.MODULE_VPN, "Session is null, cannot send data");
+            Logger.warning(LogConfig.MODULE_VPN, "Session is null, cannot send frame");
             return;
         }
 
-        s.sendData(data);
-        uploadBytes.addAndGet(data.length);
+        s.sendFrame(frame);
+        uploadBytes.addAndGet(frame.getPayloadLength());
 
-        Logger.debug(LogConfig.MODULE_VPN, "Sent " + data.length + " bytes");
-    }
-
-    /**
-     * 发送 SOCKS5 请求
-     */
-    public void sendSocks5Request(String host, int port) {
-        if (!running) {
-            return;
-        }
-
-        KcpClientSession s = session;
-        if (s == null) {
-            return;
-        }
-
-        s.sendSocks5Request(host, port);
-        Logger.info(LogConfig.MODULE_SOCKS5, "Sent SOCKS5 request: " + host + ":" + port);
+        Logger.debug(LogConfig.MODULE_VPN, "Sent frame: connectionId="
+                + frame.getConnectionId() + ", frameType="
+                + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
+                + frame.getPayloadLength());
     }
 
     /**
