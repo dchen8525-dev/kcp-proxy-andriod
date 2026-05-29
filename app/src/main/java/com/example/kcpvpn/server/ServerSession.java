@@ -175,9 +175,29 @@ public class ServerSession {
                         + frame.getConnectionId() + ", frameType="
                         + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
                         + frame.getPayloadLength());
-                handler.accept(frame);
+                if (!handleControlFrame(frame)) {
+                    handler.accept(frame);
+                }
             }
         }
+    }
+
+    private boolean handleControlFrame(KcpFrame frame) {
+        if (frame.getFrameType() == KcpFrame.TYPE_HELLO) {
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "HELLO received: " + sessionId);
+            sendFrame(new KcpFrame(KcpFrame.TYPE_HELLO_ACK, 0, null));
+            return true;
+        }
+        if (frame.getFrameType() == KcpFrame.TYPE_PING) {
+            sendFrame(new KcpFrame(KcpFrame.TYPE_PONG, 0, null));
+            return true;
+        }
+        if (frame.getFrameType() == KcpFrame.TYPE_PONG
+                || frame.getFrameType() == KcpFrame.TYPE_HELLO_ACK) {
+            touchActivity();
+            return true;
+        }
+        return false;
     }
 
     public void setSendCallback(Consumer<byte[]> callback) {
@@ -228,5 +248,9 @@ public class ServerSession {
 
     public InetSocketAddress getClientAddr() {
         return clientAddr;
+    }
+
+    public Crypto getCrypto() {
+        return crypto;
     }
 }

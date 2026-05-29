@@ -13,7 +13,7 @@ public class Logger {
 
     private final LogBuffer buffer;
     private LogWriter writer;
-    private LogLevel minLevel = LogLevel.DEBUG;
+    private LogLevel minLevel = LogLevel.INFO;
 
     /**
      * 初始化日志系统
@@ -88,28 +88,40 @@ public class Logger {
      * Debug 级别日志
      */
     public static void debug(String module, String message) {
-        getInstance().log(LogLevel.DEBUG, module, message);
+        Logger logger = instance;
+        if (logger != null) {
+            logger.log(LogLevel.DEBUG, module, message);
+        }
     }
 
     /**
      * Info 级别日志
      */
     public static void info(String module, String message) {
-        getInstance().log(LogLevel.INFO, module, message);
+        Logger logger = instance;
+        if (logger != null) {
+            logger.log(LogLevel.INFO, module, message);
+        }
     }
 
     /**
      * Warning 级别日志
      */
     public static void warning(String module, String message) {
-        getInstance().log(LogLevel.WARNING, module, message);
+        Logger logger = instance;
+        if (logger != null) {
+            logger.log(LogLevel.WARNING, module, message);
+        }
     }
 
     /**
      * Error 级别日志
      */
     public static void error(String module, String message) {
-        getInstance().log(LogLevel.ERROR, module, message);
+        Logger logger = instance;
+        if (logger != null) {
+            logger.log(LogLevel.ERROR, module, message);
+        }
     }
 
     /**

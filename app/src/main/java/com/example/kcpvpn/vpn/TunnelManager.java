@@ -151,6 +151,8 @@ public class TunnelManager {
         if (!s.isAlive() || !s.isConnected()) {
             Logger.warning(LogConfig.MODULE_VPN, "Connection lost, triggering reconnect");
             reconnect();
+        } else {
+            s.sendFrame(new KcpFrame(KcpFrame.TYPE_PING, 0, null));
         }
     }
 

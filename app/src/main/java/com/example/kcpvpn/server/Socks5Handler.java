@@ -41,7 +41,7 @@ public class Socks5Handler {
         }
 
         try {
-            AddressParser.ParsedAddress addr = AddressParser.parse(data, 3, data.length - 3);
+            AddressParser.ParsedAddress addr = AddressParser.parse(data, 3, data.length);
             if (addr.host == null || addr.host.isEmpty()) {
                 Logger.warning(LogConfig.MODULE_SOCKS5, "OPEN empty host: connectionId=" + connectionId);
                 session.sendFrame(new KcpFrame(KcpFrame.TYPE_RESET, connectionId, null));

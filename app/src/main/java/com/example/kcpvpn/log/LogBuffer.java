@@ -4,6 +4,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
 /**
@@ -19,20 +20,21 @@ public class LogBuffer {
     public LogBuffer() {
         this.maxSize = LogConfig.BUFFER_SIZE;
         this.entries = new ArrayDeque<>(maxSize);
-        this.listeners = new ArrayList<>();
+        this.listeners = new CopyOnWriteArrayList<>();
     }
 
     /**
      * 添加日志条目
      */
-    public synchronized void add(LogEntry entry) {
-        if (entries.size() >= maxSize) {
-            entries.removeFirst();
+    public void add(LogEntry entry) {
+        synchronized (this) {
+            if (entries.size() >= maxSize) {
+                entries.removeFirst();
+            }
+            entries.addLast(entry);
         }
-        entries.addLast(entry);
 
-        // 通知监听器（复制列表避免并发修改）
-        for (Consumer<LogEntry> listener : new ArrayList<>(listeners)) {
+        for (Consumer<LogEntry> listener : listeners) {
             listener.accept(entry);
         }
     }
@@ -74,14 +76,14 @@ public class LogBuffer {
     /**
      * 添加监听器
      */
-    public synchronized void addListener(Consumer<LogEntry> listener) {
+    public void addListener(Consumer<LogEntry> listener) {
         listeners.add(listener);
     }
 
     /**
      * 移除监听器
      */
-    public synchronized void removeListener(Consumer<LogEntry> listener) {
+    public void removeListener(Consumer<LogEntry> listener) {
         listeners.remove(listener);
     }
 }

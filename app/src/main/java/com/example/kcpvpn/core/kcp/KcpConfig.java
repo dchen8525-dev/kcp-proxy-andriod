@@ -21,6 +21,6 @@ public class KcpConfig {
     // nodelay 参数
     public static final int NODELAY_ENABLED = 1;
     public static final int NODELAY_INTERVAL = KCP_INTERVAL_MS;
-    public static final int NODELAY_RESEND = 5;       // fastresend 阈值（不是 rx_minrto）
+    public static final int NODELAY_RESEND = 2;       // fastresend 阈值（不是 rx_minrto）
     public static final int NODELAY_NOCWND = 1;        // 禁用拥塞控制
 }

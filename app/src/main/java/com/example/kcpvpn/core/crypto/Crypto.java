@@ -20,6 +20,8 @@ public class Crypto {
 
     private final AesGcmCipher encryptCipher;
     private final AesGcmCipher decryptCipher;
+    private final Object encryptLock = new Object();
+    private final Object decryptLock = new Object();
 
     /**
      * 创建加密实例
@@ -92,28 +94,26 @@ public class Crypto {
      * @param plaintext 明文数据
      * @return 加密后的数据：[nonce(12)] + [ciphertext] + [tag(16)]
      */
-    public synchronized byte[] encrypt(byte[] plaintext) {
-        // 检查计数器溢出
-        if (encryptCounter >= CryptoConfig.MAX_COUNTER) {
-            throw new RuntimeException("Encryption counter overflow - session must be rekeyed");
+    public byte[] encrypt(byte[] plaintext) {
+        synchronized (encryptLock) {
+            if (encryptCounter >= CryptoConfig.MAX_COUNTER) {
+                throw new RuntimeException("Encryption counter overflow - session must be rekeyed");
+            }
+
+            long counter = encryptCounter++;
+            byte[] nonce = NonceGenerator.generate(counter, localDirection);
+
+            byte[] ciphertextWithTag = encryptCipher.encrypt(plaintext, nonce);
+
+            byte[] result = new byte[CryptoConfig.NONCE_SIZE + ciphertextWithTag.length];
+            System.arraycopy(nonce, 0, result, 0, CryptoConfig.NONCE_SIZE);
+            System.arraycopy(ciphertextWithTag, 0, result, CryptoConfig.NONCE_SIZE, ciphertextWithTag.length);
+
+            Logger.debug("crypto", "Encrypt: " + plaintext.length + " bytes -> " + result.length
+                    + " bytes, counter=" + counter);
+
+            return result;
         }
-
-        // 生成 Nonce
-        long counter = encryptCounter++;
-        byte[] nonce = NonceGenerator.generate(counter, localDirection);
-
-        // 加密
-        byte[] ciphertextWithTag = encryptCipher.encrypt(plaintext, nonce);
-
-        // 组合输出：nonce + ciphertext + tag
-        byte[] result = new byte[CryptoConfig.NONCE_SIZE + ciphertextWithTag.length];
-        System.arraycopy(nonce, 0, result, 0, CryptoConfig.NONCE_SIZE);
-        System.arraycopy(ciphertextWithTag, 0, result, CryptoConfig.NONCE_SIZE, ciphertextWithTag.length);
-
-        Logger.debug("crypto", "Encrypt: " + plaintext.length + " bytes -> " + result.length
-                + " bytes, counter=" + counter);
-
-        return result;
     }
 
     /**
@@ -121,49 +121,50 @@ public class Crypto {
      * @param ciphertext 加密数据：[nonce(12)] + [ciphertext] + [tag(16)]
      * @return 明文数据
      */
-    public synchronized byte[] decrypt(byte[] ciphertext) {
-        if (ciphertext == null || ciphertext.length < CryptoConfig.NONCE_SIZE + CryptoConfig.TAG_SIZE) {
-            throw new IllegalArgumentException("Ciphertext too short");
+    public byte[] decrypt(byte[] ciphertext) {
+        synchronized (decryptLock) {
+            if (ciphertext == null || ciphertext.length < CryptoConfig.NONCE_SIZE + CryptoConfig.TAG_SIZE) {
+                throw new IllegalArgumentException("Ciphertext too short");
+            }
+
+            byte[] nonce = new byte[CryptoConfig.NONCE_SIZE];
+            System.arraycopy(ciphertext, 0, nonce, 0, CryptoConfig.NONCE_SIZE);
+
+            byte direction = NonceGenerator.parseDirection(nonce);
+            if (direction != peerDirection) {
+                throw new RuntimeException("Decryption rejected: wrong direction byte");
+            }
+
+            long counter = NonceGenerator.parseCounter(nonce);
+
+            if (!replayWindow.checkAndUpdate(counter)) {
+                throw new RuntimeException("Decryption rejected: replay or stale counter, counter=" + counter
+                        + ", highest=" + replayWindow.getHighestReceived());
+            }
+
+            int cipherDataLen = ciphertext.length - CryptoConfig.NONCE_SIZE;
+            byte[] cipherData = new byte[cipherDataLen];
+            System.arraycopy(ciphertext, CryptoConfig.NONCE_SIZE, cipherData, 0, cipherDataLen);
+
+            byte[] plaintext = decryptCipher.decrypt(cipherData, nonce);
+
+            Logger.debug("crypto", "Decrypt: " + ciphertext.length + " bytes -> " + plaintext.length
+                    + " bytes, counter=" + counter);
+
+            return plaintext;
         }
-
-        // 解析 Nonce
-        byte[] nonce = new byte[CryptoConfig.NONCE_SIZE];
-        System.arraycopy(ciphertext, 0, nonce, 0, CryptoConfig.NONCE_SIZE);
-
-        // 检查方向标识
-        byte direction = NonceGenerator.parseDirection(nonce);
-        if (direction != peerDirection) {
-            throw new RuntimeException("Decryption rejected: wrong direction byte");
-        }
-
-        // 解析计数器
-        long counter = NonceGenerator.parseCounter(nonce);
-
-        // 重放检查（在解密之前，避免无效包消耗解密资源）
-        if (!replayWindow.checkAndUpdate(counter)) {
-            throw new RuntimeException("Decryption rejected: replay or stale counter, counter=" + counter
-                    + ", highest=" + replayWindow.getHighestReceived());
-        }
-
-        // 解密
-        int cipherDataLen = ciphertext.length - CryptoConfig.NONCE_SIZE;
-        byte[] cipherData = new byte[cipherDataLen];
-        System.arraycopy(ciphertext, CryptoConfig.NONCE_SIZE, cipherData, 0, cipherDataLen);
-
-        byte[] plaintext = decryptCipher.decrypt(cipherData, nonce);
-
-        Logger.debug("crypto", "Decrypt: " + ciphertext.length + " bytes -> " + plaintext.length
-                + " bytes, counter=" + counter);
-
-        return plaintext;
     }
 
     /**
      * 重置加密状态
      */
-    public synchronized void reset() {
-        encryptCounter = 0;
-        replayWindow.reset();
+    public void reset() {
+        synchronized (encryptLock) {
+            encryptCounter = 0;
+        }
+        synchronized (decryptLock) {
+            replayWindow.reset();
+        }
         Logger.debug("crypto", "Crypto reset");
     }
 

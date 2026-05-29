@@ -33,6 +33,7 @@ public class KcpClientSession {
     private DatagramSocket udpSocket;
     private volatile boolean running;
     private volatile boolean connected;
+    private final Object handshakeLock = new Object();
 
     private final AtomicLong lastActivityTime;
 
@@ -88,11 +89,30 @@ public class KcpClientSession {
             }
 
             running = true;
-            connected = true;
+            connected = false;
             touchActivity();
 
             startUpdateThread();
             startRecvThread();
+
+            sendFrame(new KcpFrame(KcpFrame.TYPE_HELLO, 0, null));
+            long deadline = System.currentTimeMillis() + 3000;
+            synchronized (handshakeLock) {
+                while (running && !connected && System.currentTimeMillis() < deadline) {
+                    try {
+                        handshakeLock.wait(200);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+
+            if (!connected) {
+                Logger.warning(LogConfig.MODULE_KCP_CLIENT, "HELLO_ACK timeout: " + serverAddr);
+                close();
+                return false;
+            }
 
             Logger.info(LogConfig.MODULE_KCP_CLIENT, "Connected to " + serverAddr);
             return true;
@@ -124,7 +144,7 @@ public class KcpClientSession {
     private void startRecvThread() {
         recvThread = new Thread(() -> {
             byte[] recvBuf = new byte[SessionConfig.UDP_RECV_BUF_SIZE];
-            while (running && connected) {
+            while (running) {
                 try {
                     DatagramPacket packet = new DatagramPacket(recvBuf, recvBuf.length);
                     udpSocket.receive(packet);
@@ -137,7 +157,7 @@ public class KcpClientSession {
                 } catch (SocketTimeoutException e) {
                     // 正常超时
                 } catch (IOException e) {
-                    if (running && connected) {
+                    if (running) {
                         Logger.error(LogConfig.MODULE_KCP_CLIENT, "UDP receive error: " + e.getMessage());
                     }
                     break;
@@ -197,13 +217,36 @@ public class KcpClientSession {
                         + frame.getConnectionId() + ", frameType="
                         + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
                         + frame.getPayloadLength());
-                cb.accept(frame);
+                if (!handleControlFrame(frame)) {
+                    cb.accept(frame);
+                }
             }
         }
     }
 
+    private boolean handleControlFrame(KcpFrame frame) {
+        if (frame.getFrameType() == KcpFrame.TYPE_HELLO_ACK) {
+            connected = true;
+            synchronized (handshakeLock) {
+                handshakeLock.notifyAll();
+            }
+            Logger.info(LogConfig.MODULE_KCP_CLIENT, "HELLO_ACK received");
+            return true;
+        }
+        if (frame.getFrameType() == KcpFrame.TYPE_PING) {
+            sendFrame(new KcpFrame(KcpFrame.TYPE_PONG, 0, null));
+            return true;
+        }
+        if (frame.getFrameType() == KcpFrame.TYPE_PONG) {
+            touchActivity();
+            Logger.debug(LogConfig.MODULE_KCP_CLIENT, "PONG received");
+            return true;
+        }
+        return frame.getFrameType() == KcpFrame.TYPE_HELLO;
+    }
+
     private void handleKcpOutput(byte[] data, int len) {
-        if (!running || !connected || udpSocket == null) {
+        if (!running || udpSocket == null) {
             return;
         }
 
@@ -217,7 +260,7 @@ public class KcpClientSession {
     }
 
     public void sendFrame(KcpFrame frame) {
-        if (!running || !connected) {
+        if (!running) {
             return;
         }
 

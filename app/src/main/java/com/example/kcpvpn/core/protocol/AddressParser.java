@@ -39,7 +39,10 @@ public class AddressParser {
      * @return 解析结果
      */
     public static ParsedAddress parse(byte[] data, int offset, int len) {
-        if (offset >= len) {
+        if (data == null) {
+            throw new IllegalArgumentException("Address data is null");
+        }
+        if (offset < 0 || len < 0 || len > data.length || offset >= len) {
             throw new IllegalArgumentException("Insufficient data for address type");
         }
 
@@ -64,6 +67,9 @@ public class AddressParser {
                     throw new IllegalArgumentException("Insufficient data for domain length");
                 }
                 int domainLen = data[offset + 1] & 0xFF;
+                if (domainLen <= 0) {
+                    throw new IllegalArgumentException("Invalid domain length: " + domainLen);
+                }
                 if (offset + 2 + domainLen + 2 > len) {
                     throw new IllegalArgumentException("Insufficient data for domain address");
                 }
@@ -135,12 +141,18 @@ public class AddressParser {
      * 从 ByteBuffer 解析地址
      */
     public static ParsedAddress parse(ByteBuffer buf) {
+        if (buf == null || buf.remaining() < 1) {
+            throw new IllegalArgumentException("Insufficient data for address type");
+        }
         byte atyp = buf.get();
 
         ParsedAddress result = new ParsedAddress();
 
         switch (atyp) {
             case Socks5.SOCKS5_ATYP_IPV4:
+                if (buf.remaining() < 6) {
+                    throw new IllegalArgumentException("Insufficient data for IPv4 address");
+                }
                 byte[] ipv4Bytes = new byte[4];
                 buf.get(ipv4Bytes);
                 // & 0xFF 防止有符号字节产生负数
@@ -152,7 +164,13 @@ public class AddressParser {
                 break;
 
             case Socks5.SOCKS5_ATYP_DOMAIN:
+                if (buf.remaining() < 1) {
+                    throw new IllegalArgumentException("Insufficient data for domain length");
+                }
                 int domainLen = buf.get() & 0xFF;
+                if (domainLen <= 0 || buf.remaining() < domainLen + 2) {
+                    throw new IllegalArgumentException("Invalid or truncated domain address");
+                }
                 byte[] domainBytes = new byte[domainLen];
                 buf.get(domainBytes);
                 result.host = new String(domainBytes, StandardCharsets.US_ASCII);
@@ -161,6 +179,9 @@ public class AddressParser {
                 break;
 
             case Socks5.SOCKS5_ATYP_IPV6:
+                if (buf.remaining() < 18) {
+                    throw new IllegalArgumentException("Insufficient data for IPv6 address");
+                }
                 byte[] ipv6Bytes = new byte[16];
                 buf.get(ipv6Bytes);
                 result.host = formatIPv6(ipv6Bytes);

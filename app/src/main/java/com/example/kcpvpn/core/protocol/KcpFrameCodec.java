@@ -17,6 +17,7 @@ public class KcpFrameCodec {
     private static final byte VERSION = 1;
     private static final int HEADER_LEN = 16;
     private static final int MAX_PAYLOAD_LEN = 1024 * 1024;
+    private static final int MAX_PENDING_LEN = MAX_PAYLOAD_LEN + HEADER_LEN;
 
     private final String logModule;
     private final ByteArrayOutputStream pending = new ByteArrayOutputStream();
@@ -42,6 +43,14 @@ public class KcpFrameCodec {
     public synchronized List<KcpFrame> decode(byte[] data) {
         List<KcpFrame> frames = new ArrayList<>();
         if (data == null || data.length == 0) {
+            return frames;
+        }
+
+        if (pending.size() + data.length > MAX_PENDING_LEN) {
+            int dropped = pending.size() + data.length;
+            pending.reset();
+            Logger.warning(logModule, "KCP frame decode error: pending buffer overflow, dropped="
+                    + dropped);
             return frames;
         }
 
@@ -121,6 +130,11 @@ public class KcpFrameCodec {
         return frameType == KcpFrame.TYPE_OPEN
                 || frameType == KcpFrame.TYPE_DATA
                 || frameType == KcpFrame.TYPE_CLOSE
-                || frameType == KcpFrame.TYPE_RESET;
+                || frameType == KcpFrame.TYPE_RESET
+                || frameType == KcpFrame.TYPE_UDP_DATAGRAM
+                || frameType == KcpFrame.TYPE_HELLO
+                || frameType == KcpFrame.TYPE_HELLO_ACK
+                || frameType == KcpFrame.TYPE_PING
+                || frameType == KcpFrame.TYPE_PONG;
     }
 }

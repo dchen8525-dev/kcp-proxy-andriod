@@ -27,6 +27,7 @@ import com.example.kcpvpn.ui.adapters.LogAdapter;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Collections;
 import java.util.function.Consumer;
 
 /**
@@ -44,6 +45,9 @@ public class LogFragment extends Fragment {
     // 初始显示所有日志，使用最低级别 DEBUG（value=0）作为"全部"
     private LogLevel currentLogLevel = LogLevel.DEBUG;
     private Consumer<LogEntry> logListener;
+    private final List<LogEntry> pendingUiLogs = Collections.synchronizedList(new ArrayList<>());
+    private final android.os.Handler uiLogHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private boolean uiFlushScheduled;
 
     private static final String STATE_LOG_LEVEL = "log_level";
 
@@ -101,6 +105,9 @@ public class LogFragment extends Fragment {
         super.onPause();
         // 移除日志监听器
         removeLogListener();
+        uiLogHandler.removeCallbacksAndMessages(null);
+        pendingUiLogs.clear();
+        uiFlushScheduled = false;
     }
 
     /**
@@ -123,7 +130,7 @@ public class LogFragment extends Fragment {
                 if (fragment != null && fragment.isAdded() && !fragment.isRemoving()
                         && fragment.getActivity() != null && !fragment.getActivity().isFinishing()) {
                     if (entry.getLevel().getValue() >= fragment.currentLogLevel.getValue()) {
-                        fragment.addLogEntry(entry);
+                        fragment.enqueueLogEntry(entry);
                     }
                 }
             };
@@ -248,20 +255,38 @@ public class LogFragment extends Fragment {
     /**
      * 添加日志条目
      */
-    private void addLogEntry(LogEntry entry) {
+    private void enqueueLogEntry(LogEntry entry) {
         android.app.Activity activity = getActivity();
         if (activity == null || !isAdded() || isRemoving() || activity.isFinishing()) {
             return;
         }
-        activity.runOnUiThread(() -> {
+        pendingUiLogs.add(entry);
+        if (!uiFlushScheduled) {
+            uiFlushScheduled = true;
+            uiLogHandler.postDelayed(this::flushPendingLogs, 300);
+        }
+    }
+
+    private void flushPendingLogs() {
+        uiFlushScheduled = false;
+        List<LogEntry> batch;
+        synchronized (pendingUiLogs) {
+            if (pendingUiLogs.isEmpty()) {
+                return;
+            }
+            batch = new ArrayList<>(pendingUiLogs);
+            pendingUiLogs.clear();
+        }
+
+        for (LogEntry entry : batch) {
             if (logAdapter == null || !isAdded() || isRemoving()) {
                 return;
             }
             logAdapter.addLog(entry);
-            if (recyclerView != null) {
-                recyclerView.scrollToPosition(logAdapter.getItemCount() - 1);
-            }
-        });
+        }
+        if (recyclerView != null && logAdapter != null && logAdapter.getItemCount() > 0) {
+            recyclerView.scrollToPosition(logAdapter.getItemCount() - 1);
+        }
     }
 
     /**

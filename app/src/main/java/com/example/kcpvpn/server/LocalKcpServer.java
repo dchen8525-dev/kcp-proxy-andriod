@@ -15,6 +15,9 @@ import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 本地 KCP 服务端 - 用于本地自测模式。
@@ -36,6 +39,7 @@ public class LocalKcpServer {
 
     private final Map<String, ServerSession> sessions;
     private final ServerConnectionManager connectionManager;
+    private final ThreadPoolExecutor dnsExecutor;
 
     private Thread recvThread;
     private Thread cleanupThread;
@@ -47,6 +51,18 @@ public class LocalKcpServer {
 
         this.sessions = new ConcurrentHashMap<>();
         this.connectionManager = new ServerConnectionManager();
+        this.dnsExecutor = new ThreadPoolExecutor(
+                2,
+                8,
+                30,
+                TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(128),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "DNS-Relay");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                new ThreadPoolExecutor.AbortPolicy());
         this.running = false;
 
         Logger.info(LogConfig.MODULE_KCP_SERVER, "LocalKcpServer created: " + host + ":" + port);
@@ -123,8 +139,7 @@ public class LocalKcpServer {
                     + " (total: " + sessions.size() + ")");
         } else {
             try {
-                Crypto crypto = new Crypto(key, CryptoConfig.NONCE_DIR_SERVER, "");
-                byte[] decrypted = crypto.decrypt(encryptedData);
+                byte[] decrypted = session.getCrypto().decrypt(encryptedData);
                 session.receiveData(decrypted);
             } catch (Exception e) {
                 Logger.error(LogConfig.MODULE_KCP_SERVER, "Decrypt error: " + e.getMessage());
@@ -165,7 +180,9 @@ public class LocalKcpServer {
         } else if (frameType == KcpFrame.TYPE_DATA) {
             Logger.debug(LogConfig.MODULE_KCP_SERVER, "DATA frame: connectionId=" + connectionId
                     + ", payloadLength=" + frame.getPayloadLength());
-            connectionManager.writeData(connectionId, frame.getPayload());
+            connectionManager.writeData(connectionId, frame.getPayload(), session);
+        } else if (frameType == KcpFrame.TYPE_UDP_DATAGRAM) {
+            handleUdpDatagram(session, frame);
         } else if (frameType == KcpFrame.TYPE_CLOSE) {
             Logger.info(LogConfig.MODULE_KCP_SERVER, "CLOSE frame: connectionId=" + connectionId
                     + ", payloadLength=" + frame.getPayloadLength());
@@ -175,6 +192,62 @@ public class LocalKcpServer {
                     + ", payloadLength=" + frame.getPayloadLength());
             connectionManager.closeConnection(connectionId, true);
         }
+    }
+
+    private void handleUdpDatagram(ServerSession session, KcpFrame frame) {
+        try {
+            dnsExecutor.execute(() -> relayDns(session, frame));
+        } catch (RuntimeException e) {
+            Logger.error(LogConfig.MODULE_KCP_SERVER, "DNS relay executor overloaded: payloadLength="
+                    + frame.getPayloadLength());
+        }
+    }
+
+    private void relayDns(ServerSession session, KcpFrame frame) {
+        DatagramSocket socket = null;
+        try {
+            com.example.kcpvpn.vpn.PacketRouter.UdpDatagram datagram =
+                    com.example.kcpvpn.vpn.PacketRouter.parseUdpFramePayload(frame.getPayload());
+            if (datagram.dstPort != 53) {
+                Logger.debug(LogConfig.MODULE_KCP_SERVER, "Ignoring non-DNS UDP datagram, dstPort="
+                        + datagram.dstPort);
+                return;
+            }
+
+            socket = new DatagramSocket();
+            socket.setSoTimeout(3000);
+            InetAddress dnsServer = chooseDnsServer(datagram.dstAddr);
+            DatagramPacket request = new DatagramPacket(datagram.payload, datagram.payload.length,
+                    dnsServer, 53);
+            socket.send(request);
+
+            byte[] buf = new byte[1500];
+            DatagramPacket response = new DatagramPacket(buf, buf.length);
+            socket.receive(response);
+
+            byte[] dnsPayload = new byte[response.getLength()];
+            System.arraycopy(response.getData(), response.getOffset(), dnsPayload, 0, response.getLength());
+            byte[] responsePayload = com.example.kcpvpn.vpn.PacketRouter.buildUdpFramePayload(
+                    datagram.srcAddr, datagram.srcPort, datagram.dstAddr, datagram.dstPort, dnsPayload);
+            session.sendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0, responsePayload));
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "UDP DNS relayed: server="
+                    + dnsServer.getHostAddress() + ", payloadLength=" + dnsPayload.length);
+        } catch (Exception e) {
+            Logger.warning(LogConfig.MODULE_KCP_SERVER, "DNS relay failed: " + e.getMessage());
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+    }
+
+    private InetAddress chooseDnsServer(byte[] requestedAddr) throws IOException {
+        String requested = (requestedAddr[0] & 0xFF) + "." + (requestedAddr[1] & 0xFF) + "."
+                + (requestedAddr[2] & 0xFF) + "." + (requestedAddr[3] & 0xFF);
+        if (!requested.startsWith("10.0.2.") && !"0.0.0.0".equals(requested)) {
+            return InetAddress.getByName(requested);
+        }
+        return InetAddress.getByName("1.1.1.1");
     }
 
     private void sendToClient(InetSocketAddress clientAddr, byte[] data) {
@@ -237,6 +310,7 @@ public class LocalKcpServer {
         sessions.clear();
 
         connectionManager.closeAll();
+        dnsExecutor.shutdownNow();
 
         if (udpSocket != null) {
             udpSocket.close();

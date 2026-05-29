@@ -236,8 +236,8 @@ public class KcpVpnService extends VpnService {
                     .setMtu(VpnConfig.VPN_MTU)
                     .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
                     .addRoute("0.0.0.0", 0)
-                    // 使用 emulator 默认 DNS（不保护 socket，让流量走本地网络）
-                    .addDnsServer("10.0.2.3")
+                    .addDnsServer("1.1.1.1")
+                    .addDnsServer("8.8.8.8")
                     .addDisallowedApplication(getPackageName());
 
             vpnInterface = builder.establish();
