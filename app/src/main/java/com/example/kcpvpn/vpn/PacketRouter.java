@@ -194,6 +194,10 @@ public class PacketRouter {
                 conn.removeAckedServerSegments(clientAck);
                 conn.touch();
             }
+            if (!localMode && cppRemoteTunnelManager != null) {
+                Logger.info(LogConfig.MODULE_VPN, "Chrome ACK received connectionId=" + conn.connectionId
+                        + " ack=" + (clientAck & 0xFFFFFFFFL));
+            }
         }
 
         if (isRst) {
@@ -511,7 +515,7 @@ public class PacketRouter {
                 Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP IN query="
                         + addressToString(dstAddr) + ":" + dstPort
                         + " src=" + addressToString(srcAddr) + ":" + srcPort);
-                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS socket protected=" + protectedOk);
+                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP socket protected=" + protectedOk);
                 if (!protectedOk) {
                     Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE DNS_FAILED reason=protect_failed");
                     return;

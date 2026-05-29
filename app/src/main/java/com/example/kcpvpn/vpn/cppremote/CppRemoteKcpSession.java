@@ -14,6 +14,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.util.ArrayDeque;
+import java.util.Locale;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -84,6 +85,8 @@ public class CppRemoteKcpSession {
             byte[] request = CppSocks5RequestBuilder.buildIpv4Connect(dstAddr, dstPort);
             Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5 CONNECT connectionId=" + connectionId
                     + " dst=" + addrToString(dstAddr) + ":" + dstPort);
+            Logger.info(LogConfig.MODULE_VPN, "SOCKS5 request hex=" + toHex(request)
+                    + " connectionId=" + connectionId);
             sendRaw(request);
             return true;
         } catch (Exception e) {
@@ -226,8 +229,8 @@ public class CppRemoteKcpSession {
             return;
         }
         int status = data[1] & 0xFF;
-        Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5 response rep=" + status
-                + " connectionId=" + connectionId);
+        Logger.info(LogConfig.MODULE_VPN, String.format(Locale.US,
+                "CPP_REMOTE SOCKS5 response rep=0x%02X connectionId=%d", status, connectionId));
         if (status != 0) {
             close("SOCKS5_CONNECT_FAILED");
             return;
@@ -284,6 +287,9 @@ public class CppRemoteKcpSession {
             System.arraycopy(data, 0, plain, 0, len);
             byte[] encrypted = crypto.encrypt(plain);
             udpSocket.send(new DatagramPacket(encrypted, encrypted.length, serverAddr));
+            Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE UDP send to "
+                    + serverAddr.getHostString() + ":" + serverAddr.getPort()
+                    + " len=" + encrypted.length + " connectionId=" + connectionId);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE UDP_SEND_FAILED connectionId="
                     + connectionId + " error=" + e.getMessage());
@@ -316,6 +322,21 @@ public class CppRemoteKcpSession {
     private static String addrToString(byte[] addr) {
         return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
                 + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+    }
+
+    private static String toHex(byte[] data) {
+        StringBuilder sb = new StringBuilder(data.length * 3);
+        for (int i = 0; i < data.length; i++) {
+            if (i > 0) {
+                sb.append(' ');
+            }
+            int value = data[i] & 0xFF;
+            if (value < 16) {
+                sb.append('0');
+            }
+            sb.append(Integer.toHexString(value).toUpperCase(Locale.US));
+        }
+        return sb.toString();
     }
 
     public interface DataCallback {
