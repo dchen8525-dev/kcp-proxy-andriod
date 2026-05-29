@@ -19,6 +19,7 @@ import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 import com.example.kcpvpn.server.LocalKcpServer;
 import com.example.kcpvpn.ui.MainActivity;
+import com.example.kcpvpn.vpn.cppremote.CppRemoteTunnelManager;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -41,6 +42,7 @@ public class KcpVpnService extends VpnService {
     private FileChannel vpnOutputChannel;
 
     private TunnelManager tunnelManager;
+    private CppRemoteTunnelManager cppRemoteTunnelManager;
     private PacketRouter packetRouter;
 
     private Thread vpnReadThread;
@@ -263,9 +265,6 @@ public class KcpVpnService extends VpnService {
 
             Logger.info(LogConfig.MODULE_VPN, "VPN channels created");
 
-            // 创建隧道管理器
-            Logger.info(LogConfig.MODULE_VPN, "Creating TunnelManager: " + serverHost + ":" + serverPort);
-            tunnelManager = new TunnelManager(serverHost, serverPort, key);
             SocketProtector protector = new SocketProtector() {
                 @Override
                 public boolean protect(java.net.DatagramSocket socket) {
@@ -309,44 +308,64 @@ public class KcpVpnService extends VpnService {
                     Logger.warning(LogConfig.MODULE_VPN, "No underlying network found for socket binding");
                 }
             };
-            tunnelManager.setSocketProtector(protector);
-
-            // 本地模式下，为 LocalKcpServer 设置 socket 保护器
             if (localMode) {
+                // 创建本地/Android framed 隧道管理器
+                Logger.info(LogConfig.MODULE_VPN, "Creating TunnelManager: " + serverHost + ":" + serverPort);
+                tunnelManager = new TunnelManager(serverHost, serverPort, key);
+                tunnelManager.setSocketProtector(protector);
                 LocalKcpServer.setSocketProtector(protector);
                 Logger.info(LogConfig.MODULE_VPN, "LocalKcpServer SocketProtector set");
+                tunnelManager.setStateCallback(state -> {
+                    Logger.info(LogConfig.MODULE_VPN, "Tunnel state changed: " + state.getDisplayText());
+                    connectionState = state;
+                    broadcastState();
+                    updateNotification();
+                });
+                tunnelManager.setFrameReceivedCallback(frame -> {
+                    handleInboundFrame(frame);
+                });
+            } else {
+                cppRemoteTunnelManager = new CppRemoteTunnelManager(serverHost, serverPort, key);
+                cppRemoteTunnelManager.setSocketProtector(protector);
             }
-
-            tunnelManager.setStateCallback(state -> {
-                Logger.info(LogConfig.MODULE_VPN, "Tunnel state changed: " + state.getDisplayText());
-                connectionState = state;
-                broadcastState();
-                updateNotification();
-            });
-            tunnelManager.setFrameReceivedCallback(frame -> {
-                handleInboundFrame(frame);
-            });
 
             // 创建数据包路由器
             Logger.info(LogConfig.MODULE_VPN, "Creating PacketRouter");
             packetRouter = new PacketRouter();
             packetRouter.setSocketProtector(protector);
             packetRouter.setLocalMode(localMode);
+            packetRouter.setCppRemoteTunnelManager(cppRemoteTunnelManager);
             packetRouter.start();
 
-            // 连接隧道
-            Logger.info(LogConfig.MODULE_VPN, "Connecting tunnel...");
-            if (!tunnelManager.connect()) {
-                Logger.error(LogConfig.MODULE_VPN, "Tunnel connect failed");
-                closeVpn();
-                connectionState = VpnConnectionState.DISCONNECTED;
+            if (localMode) {
+                // 连接 Android framed 隧道
+                Logger.info(LogConfig.MODULE_VPN, "Connecting tunnel...");
+                if (!tunnelManager.connect()) {
+                    Logger.error(LogConfig.MODULE_VPN, "Tunnel connect failed");
+                    closeVpn();
+                    connectionState = VpnConnectionState.DISCONNECTED;
+                    broadcastState();
+                    updateNotification();
+                    stopSelf();
+                    return;
+                }
+                Logger.info(LogConfig.MODULE_VPN, "Tunnel connected successfully");
+            } else {
+                Logger.info(LogConfig.MODULE_VPN, "Starting CPP_REMOTE tunnel manager...");
+                if (!cppRemoteTunnelManager.start()) {
+                    Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE manager start failed");
+                    closeVpn();
+                    connectionState = VpnConnectionState.DISCONNECTED;
+                    broadcastState();
+                    updateNotification();
+                    stopSelf();
+                    return;
+                }
+                connectionState = VpnConnectionState.CONNECTED;
                 broadcastState();
                 updateNotification();
-                stopSelf();
-                return;
+                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE manager started successfully");
             }
-
-            Logger.info(LogConfig.MODULE_VPN, "Tunnel connected successfully");
 
             // 启动读取线程
             startVpnReadThread();
@@ -392,7 +411,13 @@ public class KcpVpnService extends VpnService {
                                 new PacketRouter.OutboundCallback() {
                                     @Override
                                     public void onSendFrame(com.example.kcpvpn.core.protocol.KcpFrame frame) {
-                                        tunnelManager.sendFrame(frame);
+                                        if (tunnelManager != null) {
+                                            tunnelManager.sendFrame(frame);
+                                        } else {
+                                            Logger.warning(LogConfig.MODULE_VPN,
+                                                    "Dropping KcpFrame in CPP_REMOTE mode: type="
+                                                            + frame.getFrameType());
+                                        }
                                         uploadBytes.addAndGet(frame.getPayloadLength());
                                     }
 
@@ -482,6 +507,10 @@ public class KcpVpnService extends VpnService {
         if (tunnelManager != null) {
             tunnelManager.disconnect();
             tunnelManager = null;
+        }
+        if (cppRemoteTunnelManager != null) {
+            cppRemoteTunnelManager.stop();
+            cppRemoteTunnelManager = null;
         }
 
         // 停止路由器

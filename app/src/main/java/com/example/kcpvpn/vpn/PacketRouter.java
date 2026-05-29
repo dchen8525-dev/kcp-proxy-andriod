@@ -5,7 +5,11 @@ import com.example.kcpvpn.core.protocol.Socks5Request;
 import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
+import com.example.kcpvpn.vpn.cppremote.CppRemoteTunnelManager;
 
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
@@ -30,6 +34,7 @@ public class PacketRouter {
     private volatile boolean running;
     private volatile boolean localMode;
     private volatile SocketProtector socketProtector;
+    private volatile CppRemoteTunnelManager cppRemoteTunnelManager;
     private Thread cleanupThread;
 
     public void setSocketProtector(SocketProtector protector) {
@@ -38,6 +43,10 @@ public class PacketRouter {
 
     public void setLocalMode(boolean localMode) {
         this.localMode = localMode;
+    }
+
+    public void setCppRemoteTunnelManager(CppRemoteTunnelManager cppRemoteTunnelManager) {
+        this.cppRemoteTunnelManager = cppRemoteTunnelManager;
     }
 
     public void start() {
@@ -105,7 +114,8 @@ public class PacketRouter {
                 handleOutboundTcp(packet, buf, ipHeaderLen, totalLen, srcAddr, dstAddr,
                         sendFrameCallback, writePacketCallback);
             } else if (protocol == 17) {
-                handleOutboundUdp(packet, buf, ipHeaderLen, totalLen, srcAddr, dstAddr, sendFrameCallback);
+                handleOutboundUdp(packet, buf, ipHeaderLen, totalLen, srcAddr, dstAddr,
+                        sendFrameCallback, writePacketCallback);
             } else {
                 Logger.debug(LogConfig.MODULE_VPN, "Ignoring non-TCP/UDP packet: protocol=" + protocol);
             }
@@ -151,7 +161,8 @@ public class PacketRouter {
                         + ", flags=" + flags + ", payloadLength=" + payloadLen);
                 return;
             }
-            conn = createConnection(key, srcAddr, srcPort, dstAddr, dstPort, clientSeq, sendFrameCallback);
+            conn = createConnection(key, srcAddr, srcPort, dstAddr, dstPort, clientSeq,
+                    sendFrameCallback, writePacketCallback);
         }
 
         if (isSyn && !isAck) {
@@ -186,7 +197,7 @@ public class PacketRouter {
         }
 
         if (isRst) {
-            sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_RESET, conn.connectionId, null));
+            sendCloseToOutbound(conn, sendFrameCallback, true);
             byte[] rstPacket = buildTcpPacket(conn, new byte[0], (byte) 0x14,
                     conn.serverNextSeq, clientSeq + 1);
             writePacketCallback.onWritePacket(rstPacket);
@@ -221,7 +232,7 @@ public class PacketRouter {
                 conn.touch();
             }
 
-            sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_DATA, conn.connectionId, payload));
+            sendOutboundTcpData(conn, payload, sendFrameCallback);
             byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10,
                     conn.serverNextSeq, conn.clientNextSeq);
             writePacketCallback.onWritePacket(ackPacket);
@@ -238,7 +249,7 @@ public class PacketRouter {
                 conn.state = TcpState.CLOSING;
                 conn.touch();
             }
-            sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_CLOSE, conn.connectionId, null));
+            sendCloseToOutbound(conn, sendFrameCallback, false);
             byte[] finAck = buildTcpPacket(conn, new byte[0], (byte) 0x11,
                     conn.serverNextSeq, conn.clientNextSeq);
             writePacketCallback.onWritePacket(finAck);
@@ -253,26 +264,37 @@ public class PacketRouter {
     }
 
     private TcpConnection createConnection(String key, byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
-                                           int clientSeq, SendFrameCallback sendFrameCallback) {
+                                           int clientSeq, SendFrameCallback sendFrameCallback,
+                                           WritePacketCallback writePacketCallback) {
         TcpConnection conn = new TcpConnection(nextConnectionId.incrementAndGet(), key, srcAddr, srcPort,
                 dstAddr, dstPort, (int) nextTcpSequence.addAndGet(0x10000L), sendFrameCallback);
         conn.clientNextSeq = clientSeq + 1;
         connectionsByKey.put(key, conn);
         connectionsById.put(conn.connectionId, conn);
 
-        byte[] openPayload = Socks5Request.buildConnectRequest(conn.dstHost, conn.dstPort);
-        sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_OPEN, conn.connectionId, openPayload));
-        Logger.info(LogConfig.MODULE_VPN, "OPEN connectionId=" + conn.connectionId
-                + " dst=" + conn.dstHost + ":" + conn.dstPort);
-        Logger.info(LogConfig.MODULE_VPN, "OPEN frame: connectionId=" + conn.connectionId
-                + ", src=" + conn.srcHost + ":" + conn.srcPort
-                + ", dst=" + conn.dstHost + ":" + conn.dstPort
-                + ", payloadLength=" + openPayload.length);
+        CppRemoteTunnelManager remoteManager = cppRemoteTunnelManager;
+        if (!localMode && remoteManager != null) {
+            Logger.info(LogConfig.MODULE_VPN, "TCP SYN connectionId=" + conn.connectionId
+                    + " mode=CPP_REMOTE dst=" + conn.dstHost + ":" + conn.dstPort);
+            remoteManager.createConnection(conn.connectionId, conn.dstAddr, conn.dstPort,
+                    data -> handleInboundRawTcpData(conn.connectionId, data, writePacketCallback),
+                    reason -> handleRemoteConnectionClosed(conn.connectionId, reason, writePacketCallback));
+        } else {
+            byte[] openPayload = Socks5Request.buildConnectRequest(conn.dstHost, conn.dstPort);
+            sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_OPEN, conn.connectionId, openPayload));
+            Logger.info(LogConfig.MODULE_VPN, "OPEN connectionId=" + conn.connectionId
+                    + " dst=" + conn.dstHost + ":" + conn.dstPort);
+            Logger.info(LogConfig.MODULE_VPN, "OPEN frame: connectionId=" + conn.connectionId
+                    + ", src=" + conn.srcHost + ":" + conn.srcPort
+                    + ", dst=" + conn.dstHost + ":" + conn.dstPort
+                    + ", payloadLength=" + openPayload.length);
+        }
         return conn;
     }
 
     private void handleOutboundUdp(byte[] packet, ByteBuffer buf, int ipHeaderLen, int totalLen,
-                                   byte[] srcAddr, byte[] dstAddr, SendFrameCallback sendFrameCallback) {
+                                   byte[] srcAddr, byte[] dstAddr, SendFrameCallback sendFrameCallback,
+                                   WritePacketCallback writePacketCallback) {
         int udpOffset = ipHeaderLen;
         if (totalLen < udpOffset + 8) {
             return;
@@ -290,6 +312,15 @@ public class PacketRouter {
                 + " len=" + payloadLen, srcPort, dstPort);
         byte[] udpPayload = new byte[payloadLen];
         System.arraycopy(packet, udpOffset + 8, udpPayload, 0, payloadLen);
+        if (!localMode && cppRemoteTunnelManager != null) {
+            if (dstPort == 53) {
+                relayDnsLocally(srcAddr, srcPort, dstAddr, dstPort, udpPayload, writePacketCallback);
+            } else {
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE ignoring non-DNS UDP dst="
+                        + addressToString(dstAddr) + ":" + dstPort + " len=" + payloadLen);
+            }
+            return;
+        }
         sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0,
                 buildUdpFramePayload(srcAddr, srcPort, dstAddr, dstPort, udpPayload)));
         String message = "UDP request: src=" + addressToString(srcAddr) + ":" + srcPort
@@ -391,6 +422,116 @@ public class PacketRouter {
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "Build inbound packet error: " + e.getMessage());
         }
+    }
+
+    public void handleInboundRawTcpData(long connectionId, byte[] payload,
+                                        WritePacketCallback writePacketCallback) {
+        TcpConnection conn = connectionsById.get(connectionId);
+        if (!running || conn == null || payload == null) {
+            return;
+        }
+        try {
+            synchronized (conn) {
+                int offset = 0;
+                while (offset < payload.length) {
+                    int segmentLen = Math.min(MAX_TCP_PAYLOAD_PER_PACKET, payload.length - offset);
+                    byte[] segment = Arrays.copyOfRange(payload, offset, offset + segmentLen);
+                    int seq = conn.serverNextSeq;
+                    byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
+                            seq, conn.clientNextSeq);
+                    writePacketCallback.onWritePacket(ipPacket);
+                    Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE TCP OUT to TUN len=" + ipPacket.length
+                            + " connectionId=" + connectionId);
+                    logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
+                    conn.addUnackedServerSegment(seq, segmentLen);
+                    conn.serverNextSeq += segmentLen;
+                    offset += segmentLen;
+                }
+                conn.touch();
+            }
+        } catch (Exception e) {
+            Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE TUN_WRITE_FAILED connectionId="
+                    + connectionId + " error=" + e.getMessage());
+        }
+    }
+
+    private void handleRemoteConnectionClosed(long connectionId, String reason,
+                                              WritePacketCallback writePacketCallback) {
+        TcpConnection conn = connectionsById.get(connectionId);
+        if (conn == null) {
+            return;
+        }
+        try {
+            byte[] packet;
+            int flags;
+            synchronized (conn) {
+                conn.state = TcpState.CLOSING;
+                flags = reason != null && reason.contains("FAILED") ? 0x14 : 0x11;
+                packet = buildTcpPacket(conn, new byte[0], (byte) flags,
+                        conn.serverNextSeq, conn.clientNextSeq);
+                if (flags == 0x11) {
+                    conn.serverNextSeq += 1;
+                }
+            }
+            writePacketCallback.onWritePacket(packet);
+            logTcpOut(conn, flags, conn.serverNextSeq, conn.clientNextSeq, 0);
+        } catch (Exception e) {
+            Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE close write failed connectionId="
+                    + connectionId + " error=" + e.getMessage());
+        } finally {
+            removeConnection(conn);
+        }
+    }
+
+    private void sendOutboundTcpData(TcpConnection conn, byte[] payload,
+                                     SendFrameCallback sendFrameCallback) {
+        CppRemoteTunnelManager remoteManager = cppRemoteTunnelManager;
+        if (!localMode && remoteManager != null) {
+            remoteManager.sendData(conn.connectionId, payload);
+            return;
+        }
+        sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_DATA, conn.connectionId, payload));
+    }
+
+    private void sendCloseToOutbound(TcpConnection conn, SendFrameCallback sendFrameCallback, boolean reset) {
+        CppRemoteTunnelManager remoteManager = cppRemoteTunnelManager;
+        if (!localMode && remoteManager != null) {
+            remoteManager.closeConnection(conn.connectionId, reset ? "tcp_rst" : "tcp_fin");
+            return;
+        }
+        sendFrameCallback.onSendFrame(new KcpFrame(reset ? KcpFrame.TYPE_RESET : KcpFrame.TYPE_CLOSE,
+                conn.connectionId, null));
+    }
+
+    private void relayDnsLocally(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort, byte[] payload,
+                                 WritePacketCallback writePacketCallback) {
+        new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                boolean protectedOk = socketProtector != null && socketProtector.protect(socket);
+                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP IN query="
+                        + addressToString(dstAddr) + ":" + dstPort
+                        + " src=" + addressToString(srcAddr) + ":" + srcPort);
+                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS socket protected=" + protectedOk);
+                if (!protectedOk) {
+                    Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE DNS_FAILED reason=protect_failed");
+                    return;
+                }
+                socket.setSoTimeout(5000);
+                InetAddress server = InetAddress.getByName("1.1.1.1");
+                socket.send(new DatagramPacket(payload, payload.length, server, 53));
+                byte[] buf = new byte[1500];
+                DatagramPacket response = new DatagramPacket(buf, buf.length);
+                socket.receive(response);
+                byte[] dnsPayload = Arrays.copyOfRange(response.getData(), response.getOffset(),
+                        response.getOffset() + response.getLength());
+                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS response received len=" + dnsPayload.length);
+                byte[] udpPacket = buildUdpPacket(dnsPayload, dstAddr, dstPort, srcAddr, srcPort);
+                writePacketCallback.onWritePacket(udpPacket);
+                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP OUT written to TUN");
+            } catch (Exception e) {
+                Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE DNS_FAILED error=" + e.getMessage());
+            }
+        }, "CPP-DNS-Relay").start();
     }
 
     private void removeConnection(TcpConnection conn) {
