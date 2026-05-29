@@ -20,8 +20,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ServerConnectionManager {
-    private static final int MAX_TCP_WORKERS = 64;
-    private static final int MAX_TCP_QUEUE = 256;
+    private static final int MAX_TCP_CONNECT_WORKERS = 64;
+    private static final int MAX_TCP_READ_WORKERS = 256;
+    private static final int REMOTE_READ_TIMEOUT_MS = 120 * 1000;
 
     private final Map<Long, ServerConnection> connections = new ConcurrentHashMap<>();
     private final ThreadPoolExecutor connectExecutor;
@@ -30,7 +31,7 @@ public class ServerConnectionManager {
     public ServerConnectionManager() {
         this.connectExecutor = new ThreadPoolExecutor(
                 0,
-                MAX_TCP_WORKERS,
+                MAX_TCP_CONNECT_WORKERS,
                 30,
                 TimeUnit.SECONDS,
                 new SynchronousQueue<>(),
@@ -42,7 +43,7 @@ public class ServerConnectionManager {
                 new ThreadPoolExecutor.AbortPolicy());
         this.readExecutor = new ThreadPoolExecutor(
                 0,
-                MAX_TCP_WORKERS,
+                MAX_TCP_READ_WORKERS,
                 30,
                 TimeUnit.SECONDS,
                 new SynchronousQueue<>(),
@@ -94,6 +95,8 @@ public class ServerConnectionManager {
             }
             Logger.info(LogConfig.MODULE_KCP_SERVER, "SERVER CONNECT connectionId=" + connectionId
                     + " dst=" + host + ":" + port + " result=START");
+            socket.setTcpNoDelay(true);
+            socket.setSoTimeout(REMOTE_READ_TIMEOUT_MS);
             socket.connect(new InetSocketAddress(host, port), ServerConfig.CONNECT_TIMEOUT_MS);
             ServerConnection conn = connections.get(connectionId);
             if (conn == null) {
