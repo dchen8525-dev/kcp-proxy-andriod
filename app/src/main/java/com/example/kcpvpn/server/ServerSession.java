@@ -112,8 +112,8 @@ public class ServerSession {
         try {
             byte[] encrypted = crypto.encrypt(data);
             sendCallback.accept(encrypted);
-            Logger.debug(LogConfig.MODULE_KCP_SERVER, "Output: " + data.length
-                    + " plain -> " + encrypted.length + " encrypted");
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "KCP encrypted UDP send len=" + encrypted.length
+                    + " plainLen=" + len + " dst=" + clientAddr);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_KCP_SERVER, "Encrypt error: " + e.getMessage());
         }
@@ -139,10 +139,10 @@ public class ServerSession {
             kcp.flush();
         }
 
-        Logger.debug(LogConfig.MODULE_KCP_SERVER, "server frame sent: connectionId="
-                + frame.getConnectionId() + ", frameType="
-                + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
-                + frame.getPayloadLength());
+        Logger.info(LogConfig.MODULE_KCP_SERVER, "FRAME SEND type="
+                + KcpFrame.frameTypeName(frame.getFrameType())
+                + " connectionId=" + frame.getConnectionId()
+                + " len=" + frame.getPayloadLength());
     }
 
     private void deliverFrames() {
@@ -171,10 +171,10 @@ public class ServerSession {
 
             List<KcpFrame> frames = frameCodec.decode(data);
             for (KcpFrame frame : frames) {
-                Logger.debug(LogConfig.MODULE_KCP_SERVER, "server frame received: connectionId="
-                        + frame.getConnectionId() + ", frameType="
-                        + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
-                        + frame.getPayloadLength());
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "FRAME RECV type="
+                        + KcpFrame.frameTypeName(frame.getFrameType())
+                        + " connectionId=" + frame.getConnectionId()
+                        + " len=" + frame.getPayloadLength());
                 if (!handleControlFrame(frame)) {
                     handler.accept(frame);
                 }

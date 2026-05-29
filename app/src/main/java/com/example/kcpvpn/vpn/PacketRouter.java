@@ -18,6 +18,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public class PacketRouter {
     private static final long ESTABLISHED_IDLE_TIMEOUT_MS = 3 * 60 * 1000L;
     private static final long CLOSING_IDLE_TIMEOUT_MS = 30 * 1000L;
+    private static final int TCP_IPV4_HEADER_LEN = 40;
+    private static final int MAX_TCP_PAYLOAD_PER_PACKET = VpnConfig.VPN_MTU - TCP_IPV4_HEADER_LEN;
 
     private final Map<String, TcpConnection> connectionsByKey = new ConcurrentHashMap<>();
     private final Map<Long, TcpConnection> connectionsById = new ConcurrentHashMap<>();
@@ -93,6 +95,10 @@ public class PacketRouter {
             byte[] srcAddr = Arrays.copyOfRange(packet, 12, 16);
             byte[] dstAddr = Arrays.copyOfRange(packet, 16, 20);
             byte protocol = buf.get(9);
+            Logger.info(LogConfig.MODULE_VPN, "PacketRouter parse protocol=" + (protocol & 0xFF)
+                    + " src=" + addressToString(srcAddr)
+                    + " dst=" + addressToString(dstAddr)
+                    + " len=" + totalLen);
             if (protocol == 6) {
                 handleOutboundTcp(packet, buf, ipHeaderLen, totalLen, srcAddr, dstAddr,
                         sendFrameCallback, writePacketCallback);
@@ -131,6 +137,8 @@ public class PacketRouter {
         boolean isRst = (flags & 0x04) != 0;
         boolean isFin = (flags & 0x01) != 0;
 
+        logTcpIn(srcAddr, srcPort, dstAddr, dstPort, flags, clientSeq, clientAck, payloadLen);
+
         String key = connectionKey(srcAddr, srcPort, dstAddr, dstPort);
         TcpConnection conn = connectionsByKey.get(key);
         if (conn == null) {
@@ -147,8 +155,10 @@ public class PacketRouter {
         if (isSyn && !isAck) {
             synchronized (conn) {
                 conn.clientNextSeq = clientSeq + 1;
-                writePacketCallback.onWritePacket(buildTcpPacket(conn, new byte[0], (byte) 0x12,
-                        conn.serverInitialSeq, conn.clientNextSeq));
+                byte[] synAck = buildTcpPacket(conn, new byte[0], (byte) 0x12,
+                        conn.serverInitialSeq, conn.clientNextSeq);
+                writePacketCallback.onWritePacket(synAck);
+                logTcpOut(conn, 0x12, conn.serverInitialSeq, conn.clientNextSeq, 0);
                 if (!conn.synAckSent) {
                     conn.serverNextSeq = conn.serverInitialSeq + 1;
                     conn.synAckSent = true;
@@ -175,8 +185,10 @@ public class PacketRouter {
 
         if (isRst) {
             sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_RESET, conn.connectionId, null));
-            writePacketCallback.onWritePacket(buildTcpPacket(conn, new byte[0], (byte) 0x14,
-                    conn.serverNextSeq, clientSeq + 1));
+            byte[] rstPacket = buildTcpPacket(conn, new byte[0], (byte) 0x14,
+                    conn.serverNextSeq, clientSeq + 1);
+            writePacketCallback.onWritePacket(rstPacket);
+            logTcpOut(conn, 0x14, conn.serverNextSeq, clientSeq + 1, 0);
             removeConnection(conn);
             Logger.info(LogConfig.MODULE_VPN, "RESET frame: connectionId=" + conn.connectionId
                     + ", src=" + conn.srcHost + ":" + conn.srcPort
@@ -189,8 +201,10 @@ public class PacketRouter {
             System.arraycopy(packet, payloadOffset, payload, 0, payloadLen);
             synchronized (conn) {
                 if (clientSeq < conn.clientNextSeq) {
-                    writePacketCallback.onWritePacket(buildTcpPacket(conn, new byte[0], (byte) 0x10,
-                            conn.serverNextSeq, conn.clientNextSeq));
+                    byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10,
+                            conn.serverNextSeq, conn.clientNextSeq);
+                    writePacketCallback.onWritePacket(ackPacket);
+                    logTcpOut(conn, 0x10, conn.serverNextSeq, conn.clientNextSeq, 0);
                     Logger.debug(LogConfig.MODULE_VPN, "Ignoring duplicate TCP payload: connectionId="
                             + conn.connectionId + ", seq=" + clientSeq + ", expected=" + conn.clientNextSeq);
                     return;
@@ -206,8 +220,10 @@ public class PacketRouter {
             }
 
             sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_DATA, conn.connectionId, payload));
-            writePacketCallback.onWritePacket(buildTcpPacket(conn, new byte[0], (byte) 0x10,
-                    conn.serverNextSeq, conn.clientNextSeq));
+            byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10,
+                    conn.serverNextSeq, conn.clientNextSeq);
+            writePacketCallback.onWritePacket(ackPacket);
+            logTcpOut(conn, 0x10, conn.serverNextSeq, conn.clientNextSeq, 0);
             Logger.debug(LogConfig.MODULE_VPN, "DATA frame: connectionId=" + conn.connectionId
                     + ", src=" + conn.srcHost + ":" + conn.srcPort
                     + ", dst=" + conn.dstHost + ":" + conn.dstPort
@@ -221,8 +237,10 @@ public class PacketRouter {
                 conn.touch();
             }
             sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_CLOSE, conn.connectionId, null));
-            writePacketCallback.onWritePacket(buildTcpPacket(conn, new byte[0], (byte) 0x11,
-                    conn.serverNextSeq, conn.clientNextSeq));
+            byte[] finAck = buildTcpPacket(conn, new byte[0], (byte) 0x11,
+                    conn.serverNextSeq, conn.clientNextSeq);
+            writePacketCallback.onWritePacket(finAck);
+            logTcpOut(conn, 0x11, conn.serverNextSeq, conn.clientNextSeq, 0);
             synchronized (conn) {
                 conn.serverNextSeq += 1;
             }
@@ -242,6 +260,8 @@ public class PacketRouter {
 
         byte[] openPayload = Socks5Request.buildConnectRequest(conn.dstHost, conn.dstPort);
         sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_OPEN, conn.connectionId, openPayload));
+        Logger.info(LogConfig.MODULE_VPN, "OPEN connectionId=" + conn.connectionId
+                + " dst=" + conn.dstHost + ":" + conn.dstPort);
         Logger.info(LogConfig.MODULE_VPN, "OPEN frame: connectionId=" + conn.connectionId
                 + ", src=" + conn.srcHost + ":" + conn.srcPort
                 + ", dst=" + conn.dstHost + ":" + conn.dstPort
@@ -262,6 +282,10 @@ public class PacketRouter {
         if (payloadLen <= 0 || udpOffset + 8 + payloadLen > totalLen) {
             return;
         }
+        Logger.info(LogConfig.MODULE_VPN, "UDP IN src=" + addressToString(srcAddr) + ":" + srcPort
+                + " dst=" + addressToString(dstAddr) + ":" + dstPort
+                + " dstPort=" + dstPort
+                + " len=" + payloadLen);
         byte[] udpPayload = new byte[payloadLen];
         System.arraycopy(packet, udpOffset + 8, udpPayload, 0, payloadLen);
         sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0,
@@ -284,8 +308,13 @@ public class PacketRouter {
         if (frame.getFrameType() == KcpFrame.TYPE_UDP_DATAGRAM) {
             try {
                 UdpDatagram datagram = parseUdpFramePayload(frame.getPayload());
-                writePacketCallback.onWritePacket(buildUdpPacket(datagram.payload, datagram.dstAddr,
-                        datagram.dstPort, datagram.srcAddr, datagram.srcPort));
+                byte[] udpPacket = buildUdpPacket(datagram.payload, datagram.dstAddr,
+                        datagram.dstPort, datagram.srcAddr, datagram.srcPort);
+                writePacketCallback.onWritePacket(udpPacket);
+                Logger.info(LogConfig.MODULE_VPN, "UDP OUT src=" + addressToString(datagram.dstAddr)
+                        + ":" + datagram.dstPort
+                        + " dst=" + addressToString(datagram.srcAddr) + ":" + datagram.srcPort
+                        + " len=" + datagram.payload.length);
                 String message = "UDP response: src="
                         + addressToString(datagram.dstAddr) + ":" + datagram.dstPort
                         + ", dst=" + addressToString(datagram.srcAddr) + ":" + datagram.srcPort
@@ -312,28 +341,46 @@ public class PacketRouter {
 
         try {
             if (frame.getFrameType() == KcpFrame.TYPE_DATA) {
-                byte[] ipPacket;
+                byte[] payload = frame.getPayload();
+                if (payload == null) {
+                    payload = new byte[0];
+                }
                 synchronized (conn) {
-                    ipPacket = buildTcpPacket(conn, frame.getPayload(), (byte) 0x18,
-                            conn.serverNextSeq, conn.clientNextSeq);
-                    conn.addUnackedServerSegment(conn.serverNextSeq, frame.getPayloadLength());
-                    conn.serverNextSeq += frame.getPayloadLength();
+                    int offset = 0;
+                    while (offset < payload.length) {
+                        int segmentLen = Math.min(MAX_TCP_PAYLOAD_PER_PACKET, payload.length - offset);
+                        byte[] segment = Arrays.copyOfRange(payload, offset, offset + segmentLen);
+                        int seq = conn.serverNextSeq;
+                        byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
+                                seq, conn.clientNextSeq);
+                        writePacketCallback.onWritePacket(ipPacket);
+                        logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
+                        conn.addUnackedServerSegment(seq, segmentLen);
+                        conn.serverNextSeq += segmentLen;
+                        offset += segmentLen;
+                    }
                     conn.touch();
                 }
-                writePacketCallback.onWritePacket(ipPacket);
             } else if (frame.getFrameType() == KcpFrame.TYPE_CLOSE) {
                 byte[] finAck;
+                int seq;
+                int ack;
                 synchronized (conn) {
                     conn.state = TcpState.CLOSING;
+                    seq = conn.serverNextSeq;
+                    ack = conn.clientNextSeq;
                     finAck = buildTcpPacket(conn, new byte[0], (byte) 0x11,
-                            conn.serverNextSeq, conn.clientNextSeq);
+                            seq, ack);
                     conn.serverNextSeq += 1;
                     conn.touch();
                 }
                 writePacketCallback.onWritePacket(finAck);
+                logTcpOut(conn, 0x11, seq, ack, 0);
             } else if (frame.getFrameType() == KcpFrame.TYPE_RESET) {
-                writePacketCallback.onWritePacket(buildTcpPacket(conn, new byte[0], (byte) 0x14,
-                        conn.serverNextSeq, conn.clientNextSeq));
+                byte[] rstPacket = buildTcpPacket(conn, new byte[0], (byte) 0x14,
+                        conn.serverNextSeq, conn.clientNextSeq);
+                writePacketCallback.onWritePacket(rstPacket);
+                logTcpOut(conn, 0x14, conn.serverNextSeq, conn.clientNextSeq, 0);
                 removeConnection(conn);
             }
             Logger.debug(LogConfig.MODULE_VPN, "Inbound frame: connectionId=" + conn.connectionId
@@ -491,6 +538,25 @@ public class PacketRouter {
     private static String addressToString(byte[] addr) {
         return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
                 + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+    }
+
+    private static void logTcpIn(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
+                                 int flags, int seq, int ack, int len) {
+        Logger.info(LogConfig.MODULE_VPN, "TCP IN src=" + addressToString(srcAddr) + ":" + srcPort
+                + " dst=" + addressToString(dstAddr) + ":" + dstPort
+                + " flags=0x" + Integer.toHexString(flags)
+                + " seq=" + (seq & 0xFFFFFFFFL)
+                + " ack=" + (ack & 0xFFFFFFFFL)
+                + " len=" + len);
+    }
+
+    private static void logTcpOut(TcpConnection conn, int flags, int seq, int ack, int len) {
+        Logger.info(LogConfig.MODULE_VPN, "TCP OUT src=" + conn.dstHost + ":" + conn.dstPort
+                + " dst=" + conn.srcHost + ":" + conn.srcPort
+                + " flags=0x" + Integer.toHexString(flags)
+                + " seq=" + (seq & 0xFFFFFFFFL)
+                + " ack=" + (ack & 0xFFFFFFFFL)
+                + " len=" + len);
     }
 
     private void startCleanupThread() {

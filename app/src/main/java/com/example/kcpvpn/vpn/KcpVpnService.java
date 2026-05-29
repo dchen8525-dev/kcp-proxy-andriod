@@ -239,6 +239,8 @@ public class KcpVpnService extends VpnService {
                     .addDnsServer("1.1.1.1")
                     .addDnsServer("8.8.8.8")
                     .addDisallowedApplication(getPackageName());
+            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 dns=1.1.1.1,8.8.8.8 excludedApp="
+                    + getPackageName() + " chromeExcluded=false");
 
             vpnInterface = builder.establish();
 
@@ -383,6 +385,7 @@ public class KcpVpnService extends VpnService {
                         buffer.flip();
                         byte[] packet = new byte[len];
                         buffer.get(packet);
+                        Logger.info(LogConfig.MODULE_VPN, "TUN IN len=" + len);
 
                         // 处理出站数据包
                         packetRouter.handleOutboundPacket(packet,
@@ -453,7 +456,7 @@ public class KcpVpnService extends VpnService {
                             writeToVpn(packet);
                             downloadBytes.addAndGet(packet.length);
 
-                            Logger.debug(LogConfig.MODULE_VPN, "VPN write: " + packet.length + " bytes");
+                            Logger.info(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
                         } catch (IOException e) {
                             Logger.error(LogConfig.MODULE_VPN, "VPN write error: " + e.getMessage());
                         }
@@ -464,6 +467,7 @@ public class KcpVpnService extends VpnService {
     private synchronized void writeToVpn(byte[] packet) throws IOException {
         ByteBuffer buffer = ByteBuffer.wrap(packet);
         vpnOutputChannel.write(buffer);
+        Logger.info(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
     }
 
     /**

@@ -13,7 +13,7 @@ import java.net.Socket;
 import java.util.Map;
 import java.util.ArrayDeque;
 import java.util.Queue;
-import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -24,17 +24,30 @@ public class ServerConnectionManager {
     private static final int MAX_TCP_QUEUE = 256;
 
     private final Map<Long, ServerConnection> connections = new ConcurrentHashMap<>();
-    private final ThreadPoolExecutor tcpExecutor;
+    private final ThreadPoolExecutor connectExecutor;
+    private final ThreadPoolExecutor readExecutor;
 
     public ServerConnectionManager() {
-        this.tcpExecutor = new ThreadPoolExecutor(
-                8,
+        this.connectExecutor = new ThreadPoolExecutor(
+                0,
                 MAX_TCP_WORKERS,
                 30,
                 TimeUnit.SECONDS,
-                new ArrayBlockingQueue<>(MAX_TCP_QUEUE),
+                new SynchronousQueue<>(),
                 runnable -> {
-                    Thread thread = new Thread(runnable, "ServerTCP-Worker");
+                    Thread thread = new Thread(runnable, "ServerTCP-Connect");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                new ThreadPoolExecutor.AbortPolicy());
+        this.readExecutor = new ThreadPoolExecutor(
+                0,
+                MAX_TCP_WORKERS,
+                30,
+                TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "ServerTCP-Read");
                     thread.setDaemon(true);
                     return thread;
                 },
@@ -56,7 +69,7 @@ public class ServerConnectionManager {
         }
 
         try {
-            tcpExecutor.execute(() -> connectAndStart(connectionId, host, port, session, socketProtector));
+            connectExecutor.execute(() -> connectAndStart(connectionId, host, port, session, socketProtector));
         } catch (RuntimeException e) {
             Logger.error(LogConfig.MODULE_KCP_SERVER, "TCP executor overloaded: connectionId="
                     + connectionId + ", dst=" + host + ":" + port);
@@ -70,9 +83,17 @@ public class ServerConnectionManager {
         Socket socket = new Socket();
         try {
             if (socketProtector != null) {
-                socketProtector.protect(socket);
                 socketProtector.bindToNetwork(socket);
+                boolean protectedOk = socketProtector.protect(socket);
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "protect remote tcp socket=" + protectedOk);
+                if (!protectedOk) {
+                    throw new IOException("protect remote tcp socket failed");
+                }
+            } else {
+                throw new IOException("missing SocketProtector for remote tcp socket");
             }
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "SERVER CONNECT connectionId=" + connectionId
+                    + " dst=" + host + ":" + port + " result=START");
             socket.connect(new InetSocketAddress(host, port), ServerConfig.CONNECT_TIMEOUT_MS);
             ServerConnection conn = connections.get(connectionId);
             if (conn == null) {
@@ -83,11 +104,15 @@ public class ServerConnectionManager {
 
             Logger.info(LogConfig.MODULE_KCP_SERVER, "Socket open: connectionId=" + connectionId
                     + ", dst=" + host + ":" + port + ", payloadLength=0");
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "SERVER CONNECT connectionId=" + connectionId
+                    + " dst=" + host + ":" + port + " result=OK");
             conn.drainPendingWrites(session);
             startRemoteRead(conn, session);
         } catch (IOException e) {
             Logger.error(LogConfig.MODULE_KCP_SERVER, "Socket open failed: connectionId=" + connectionId
                     + ", dst=" + host + ":" + port + ", error=" + e.getMessage());
+            Logger.error(LogConfig.MODULE_KCP_SERVER, "SERVER CONNECT connectionId=" + connectionId
+                    + " dst=" + host + ":" + port + " result=FAIL error=" + e.getMessage());
             closeQuietly(socket);
             connections.remove(connectionId);
             session.sendFrame(new KcpFrame(KcpFrame.TYPE_RESET, connectionId, null));
@@ -116,7 +141,7 @@ public class ServerConnectionManager {
                 }
                 conn.outputStream.write(data);
                 conn.outputStream.flush();
-                Logger.debug(LogConfig.MODULE_KCP_SERVER, "KCP -> TCP DATA: connectionId=" + connectionId
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "remote TCP socket send connectionId=" + connectionId
                         + ", dst=" + conn.host + ":" + conn.port
                         + ", payloadLength=" + (data == null ? 0 : data.length));
             } catch (IOException e) {
@@ -153,7 +178,8 @@ public class ServerConnectionManager {
         for (Long connectionId : connections.keySet()) {
             closeConnection(connectionId, false);
         }
-        tcpExecutor.shutdownNow();
+        connectExecutor.shutdownNow();
+        readExecutor.shutdownNow();
         Logger.info(LogConfig.MODULE_KCP_SERVER, "All connections closed");
     }
 
@@ -163,7 +189,7 @@ public class ServerConnectionManager {
 
     private void startRemoteRead(ServerConnection conn, ServerSession session) {
         try {
-            tcpExecutor.execute(() -> readRemote(conn, session));
+            readExecutor.execute(() -> readRemote(conn, session));
         } catch (RuntimeException e) {
             Logger.error(LogConfig.MODULE_KCP_SERVER, "TCP read executor overloaded: connectionId="
                     + conn.connectionId);
@@ -189,7 +215,7 @@ public class ServerConnectionManager {
                 byte[] data = new byte[len];
                 System.arraycopy(buffer, 0, data, 0, len);
                 session.sendFrame(new KcpFrame(KcpFrame.TYPE_DATA, conn.connectionId, data));
-                Logger.debug(LogConfig.MODULE_KCP_SERVER, "TCP -> KCP DATA: connectionId="
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "remote response connectionId="
                         + conn.connectionId + ", dst=" + conn.host + ":" + conn.port
                         + ", payloadLength=" + len);
             }
@@ -268,6 +294,9 @@ public class ServerConnectionManager {
                     byte[] data = pendingWrites.remove();
                     pendingBytes -= data.length;
                     outputStream.write(data);
+                    Logger.info(LogConfig.MODULE_KCP_SERVER, "remote TCP socket send connectionId="
+                            + connectionId + ", dst=" + host + ":" + port
+                            + ", payloadLength=" + data.length);
                 }
                 outputStream.flush();
             }

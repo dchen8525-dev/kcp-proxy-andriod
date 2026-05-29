@@ -87,7 +87,12 @@ public class KcpClientSession {
             SocketProtector protector = socketProtector;
             if (protector != null) {
                 boolean protectedOk = protector.protect(udpSocket);
-                Logger.info(LogConfig.MODULE_KCP_CLIENT, "UDP socket protected: " + protectedOk);
+                Logger.info(LogConfig.MODULE_KCP_CLIENT, "protect kcp udp socket=" + protectedOk);
+                if (!protectedOk) {
+                    throw new IOException("protect kcp udp socket failed");
+                }
+            } else {
+                throw new IOException("missing SocketProtector for kcp udp socket");
             }
 
             running = true;
@@ -215,10 +220,10 @@ public class KcpClientSession {
 
             List<KcpFrame> frames = frameCodec.decode(data);
             for (KcpFrame frame : frames) {
-                Logger.debug(LogConfig.MODULE_KCP_CLIENT, "Recv frame: connectionId="
-                        + frame.getConnectionId() + ", frameType="
-                        + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
-                        + frame.getPayloadLength());
+                Logger.info(LogConfig.MODULE_KCP_CLIENT, "FRAME RECV type="
+                        + KcpFrame.frameTypeName(frame.getFrameType())
+                        + " connectionId=" + frame.getConnectionId()
+                        + " len=" + frame.getPayloadLength());
                 if (!handleControlFrame(frame)) {
                     cb.accept(frame);
                 }
@@ -257,6 +262,8 @@ public class KcpClientSession {
             byte[] encrypted = crypto.encrypt(data);
             DatagramPacket packet = new DatagramPacket(encrypted, encrypted.length, serverAddr);
             udpSocket.send(packet);
+            Logger.info(LogConfig.MODULE_KCP_CLIENT, "KCP encrypted UDP send len=" + encrypted.length
+                    + " plainLen=" + len + " dst=" + serverAddr);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_KCP_CLIENT, "Encrypt/send error: " + e.getMessage());
         }
@@ -282,10 +289,10 @@ public class KcpClientSession {
             kcp.flush();
         }
 
-        Logger.debug(LogConfig.MODULE_KCP_CLIENT, "Sent frame: connectionId="
-                + frame.getConnectionId() + ", frameType="
-                + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
-                + frame.getPayloadLength());
+        Logger.info(LogConfig.MODULE_KCP_CLIENT, "FRAME SEND type="
+                + KcpFrame.frameTypeName(frame.getFrameType())
+                + " connectionId=" + frame.getConnectionId()
+                + " len=" + frame.getPayloadLength());
     }
 
     public void setOnFrameReceived(Consumer<KcpFrame> callback) {

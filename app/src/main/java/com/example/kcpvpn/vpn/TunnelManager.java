@@ -136,10 +136,10 @@ public class TunnelManager {
         s.sendFrame(frame);
         uploadBytes.addAndGet(frame.getPayloadLength());
 
-        Logger.debug(LogConfig.MODULE_VPN, "Sent frame: connectionId="
-                + frame.getConnectionId() + ", frameType="
-                + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
-                + frame.getPayloadLength());
+        Logger.info(LogConfig.MODULE_VPN, "FRAME SEND type="
+                + KcpFrame.frameTypeName(frame.getFrameType())
+                + " connectionId=" + frame.getConnectionId()
+                + " len=" + frame.getPayloadLength());
     }
 
     public void checkConnection() {

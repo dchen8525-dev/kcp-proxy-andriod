@@ -213,6 +213,11 @@ public class LocalKcpServer {
             com.example.kcpvpn.vpn.PacketRouter.UdpDatagram datagram =
                     com.example.kcpvpn.vpn.PacketRouter.parseUdpFramePayload(frame.getPayload());
             InetAddress remoteServer = chooseUdpServer(datagram);
+            if (datagram.dstPort == 53) {
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "DNS RELAY query dst="
+                        + remoteServer.getHostAddress() + ":" + datagram.dstPort
+                        + " result=START");
+            }
             String key = udpRelayKey(session.getSessionId(), datagram, remoteServer);
             UdpRelay relay = udpRelays.get(key);
             if (relay == null) {
@@ -227,8 +232,14 @@ public class LocalKcpServer {
             logUdpRelay(datagram.dstPort, "UDP relayed: server="
                     + remoteServer.getHostAddress() + ":" + datagram.dstPort
                     + ", payloadLength=" + datagram.payload.length);
+            if (datagram.dstPort == 53) {
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "SERVER DNS RELAY to "
+                        + remoteServer.getHostAddress() + " result=SENT");
+            }
         } catch (Exception e) {
             Logger.warning(LogConfig.MODULE_KCP_SERVER, "UDP relay failed: " + e.getMessage());
+            Logger.warning(LogConfig.MODULE_KCP_SERVER, "DNS RELAY query dst=unknown result=FAIL error="
+                    + e.getMessage());
         }
     }
 
@@ -385,7 +396,18 @@ public class LocalKcpServer {
             this.socket.setSoTimeout(1000);
             SocketProtector protector = socketProtector;
             if (protector != null) {
-                protector.protect(socket);
+                boolean protectedOk = protector.protect(socket);
+                if (remotePort == 53) {
+                    Logger.info(LogConfig.MODULE_KCP_SERVER, "protect dns udp socket=" + protectedOk);
+                } else {
+                    Logger.debug(LogConfig.MODULE_KCP_SERVER, "protect remote udp socket=" + protectedOk
+                            + " dst=" + remoteAddr.getHostAddress() + ":" + remotePort);
+                }
+                if (!protectedOk) {
+                    throw new IOException("protect udp relay socket failed");
+                }
+            } else {
+                throw new IOException("missing SocketProtector for udp relay socket");
             }
             this.closed = new AtomicBoolean(false);
             this.lastActivityTime = System.currentTimeMillis();
@@ -423,6 +445,11 @@ public class LocalKcpServer {
                     logUdpRelay(remotePort, "UDP response relayed: server="
                             + remoteAddr.getHostAddress() + ":" + remotePort
                             + ", payloadLength=" + udpPayload.length);
+                    if (remotePort == 53) {
+                        Logger.info(LogConfig.MODULE_KCP_SERVER, "SERVER DNS response dst="
+                                + remoteAddr.getHostAddress() + ":" + remotePort
+                                + " payloadLength=" + udpPayload.length);
+                    }
                 }
             } catch (Exception e) {
                 if (running && !closed.get()) {
