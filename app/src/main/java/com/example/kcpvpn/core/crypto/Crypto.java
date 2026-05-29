@@ -141,7 +141,8 @@ public class Crypto {
 
         // 重放检查（在解密之前，避免无效包消耗解密资源）
         if (!replayWindow.checkAndUpdate(counter)) {
-            throw new RuntimeException("Decryption rejected: replay or stale counter");
+            throw new RuntimeException("Decryption rejected: replay or stale counter, counter=" + counter
+                    + ", highest=" + replayWindow.getHighestReceived());
         }
 
         // 解密

@@ -2,6 +2,7 @@ package com.example.kcpvpn.vpn;
 
 import com.example.kcpvpn.core.protocol.KcpFrame;
 import com.example.kcpvpn.core.protocol.Socks5Request;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
@@ -13,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 数据包路由器 - 处理 VPN 数据包与 KCP frame 的转换
+ * 数据包路由器 - 处理 VPN 数据包与 KCP frame 的转换。
  */
 public class PacketRouter {
 
@@ -22,6 +23,8 @@ public class PacketRouter {
     private final AtomicLong nextConnectionId;
     private final AtomicLong nextTcpSequence;
     private volatile boolean running;
+    private volatile boolean localMode;
+    private volatile SocketProtector socketProtector;
 
     public PacketRouter() {
         this.connectionsByKey = new ConcurrentHashMap<>();
@@ -31,9 +34,18 @@ public class PacketRouter {
         this.running = false;
     }
 
+    public void setSocketProtector(SocketProtector protector) {
+        this.socketProtector = protector;
+    }
+
+    public void setLocalMode(boolean localMode) {
+        this.localMode = localMode;
+    }
+
     public void start() {
         running = true;
-        Logger.info(LogConfig.MODULE_VPN, "PacketRouter started");
+        Logger.info(LogConfig.MODULE_VPN, "PacketRouter started, localMode=" + localMode
+                + ", socketProtectorSet=" + (socketProtector != null));
     }
 
     public void stop() {
@@ -50,6 +62,20 @@ public class PacketRouter {
 
     private static String connectionKey(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort) {
         return addressToString(srcAddr) + ":" + srcPort + "->" + addressToString(dstAddr) + ":" + dstPort;
+    }
+
+    public void handleOutboundPacket(byte[] packet, OutboundCallback callback) {
+        handleOutboundPacket(packet, new SendFrameCallback() {
+            @Override
+            public void onSendFrame(KcpFrame frame) {
+                callback.onSendFrame(frame);
+            }
+        }, new WritePacketCallback() {
+            @Override
+            public void onWritePacket(byte[] packet) {
+                callback.onWriteToVpn(packet);
+            }
+        });
     }
 
     public void handleOutboundPacket(byte[] packet, SendFrameCallback sendFrameCallback,
@@ -319,6 +345,11 @@ public class PacketRouter {
     private static String addressToString(byte[] addr) {
         return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
                 + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+    }
+
+    public interface OutboundCallback {
+        void onSendFrame(KcpFrame frame);
+        void onWriteToVpn(byte[] packet);
     }
 
     public interface SendFrameCallback {

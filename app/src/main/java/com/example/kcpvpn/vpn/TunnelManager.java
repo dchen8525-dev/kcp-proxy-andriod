@@ -3,6 +3,7 @@ package com.example.kcpvpn.vpn;
 import com.example.kcpvpn.core.crypto.Crypto;
 import com.example.kcpvpn.core.protocol.KcpFrame;
 import com.example.kcpvpn.core.session.KcpClientSession;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.core.session.SessionConfig;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
@@ -13,7 +14,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
- * 阧道管理器 - 管理 KCP 连接生命周期和重连
+ * 隧道管理器 - 管理 KCP 连接生命周期和重连。
  */
 public class TunnelManager {
 
@@ -27,21 +28,19 @@ public class TunnelManager {
     private volatile boolean running;
     private final AtomicBoolean connecting = new AtomicBoolean(false);
 
-    // 重连参数（指数退避）
     private final AtomicInteger reconnectAttempts;
     private final AtomicInteger reconnectDelayMs;
     private static final int INITIAL_DELAY_MS = 1000;
     private static final int MAX_DELAY_MS = 60000;
     private static final int DELAY_FACTOR = 2;
 
-    // 流量统计
     private final AtomicLong uploadBytes;
     private final AtomicLong downloadBytes;
     private final AtomicLong connectionStartTime;
 
-    // 状态回调
     private volatile Consumer<VpnConnectionState> stateCallback;
     private volatile Consumer<KcpFrame> frameReceivedCallback;
+    private volatile SocketProtector socketProtector;
 
     public TunnelManager(String serverHost, int serverPort, String key) {
         this.serverHost = serverHost;
@@ -56,24 +55,18 @@ public class TunnelManager {
         this.connectionStartTime = new AtomicLong(0);
     }
 
-    /**
-     * 设置状态回调
-     */
     public void setStateCallback(Consumer<VpnConnectionState> callback) {
         this.stateCallback = callback;
     }
 
-    /**
-     * 设置数据接收回调
-     */
     public void setFrameReceivedCallback(Consumer<KcpFrame> callback) {
         this.frameReceivedCallback = callback;
     }
 
-    /**
-     * 连接阧道
-     * @return true 成功
-     */
+    public void setSocketProtector(SocketProtector protector) {
+        this.socketProtector = protector;
+    }
+
     public boolean connect() {
         Logger.info(LogConfig.MODULE_VPN, "TunnelManager.connect() begin");
 
@@ -85,15 +78,14 @@ public class TunnelManager {
         updateState(VpnConnectionState.CONNECTING);
 
         try {
-            // 创建加密实例
-            Logger.info(LogConfig.MODULE_VPN, "Creating Crypto instance with key length=" + key.length());
             crypto = new Crypto(key);
-            Logger.info(LogConfig.MODULE_VPN, "Crypto instance created");
 
-            // 创建 KCP 会话
-            Logger.info(LogConfig.MODULE_VPN, "Creating KcpClientSession: " + serverHost + ":" + serverPort);
             session = new KcpClientSession(serverHost, serverPort, crypto);
-            Logger.info(LogConfig.MODULE_VPN, "KcpClientSession created");
+            SocketProtector protector = socketProtector;
+            if (protector != null) {
+                session.setSocketProtector(protector);
+                Logger.info(LogConfig.MODULE_VPN, "SocketProtector set for KcpClientSession");
+            }
 
             session.setOnFrameReceived(frame -> {
                 Consumer<KcpFrame> cb = frameReceivedCallback;
@@ -103,16 +95,12 @@ public class TunnelManager {
                 downloadBytes.addAndGet(frame.getPayloadLength());
             });
 
-            // 连接
-            Logger.info(LogConfig.MODULE_VPN, "Calling session.connect()...");
             if (!session.connect()) {
                 Logger.error(LogConfig.MODULE_VPN, "KCP session.connect() returned false");
                 connecting.set(false);
                 updateState(VpnConnectionState.DISCONNECTED);
                 return false;
             }
-
-            Logger.info(LogConfig.MODULE_VPN, "KCP session connected");
 
             running = true;
             connecting.set(false);
@@ -124,7 +112,6 @@ public class TunnelManager {
             Logger.info(LogConfig.MODULE_VPN, "Tunnel connected: " + serverHost + ":" + serverPort);
 
             return true;
-
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "Connect error: " + e.getMessage());
             e.printStackTrace();
@@ -134,9 +121,6 @@ public class TunnelManager {
         }
     }
 
-    /**
-     * 发送数据
-     */
     public void sendFrame(KcpFrame frame) {
         if (!running) {
             Logger.warning(LogConfig.MODULE_VPN, "Not connected, cannot send frame");
@@ -158,9 +142,6 @@ public class TunnelManager {
                 + frame.getPayloadLength());
     }
 
-    /**
-     * 检查连接状态
-     */
     public void checkConnection() {
         KcpClientSession s = session;
         if (!running || s == null) {
@@ -173,28 +154,20 @@ public class TunnelManager {
         }
     }
 
-    /**
-     * 重新连接（指数退避）
-     * 不在 disconnectInternal 中重置退避参数，保留指数退避状态
-     */
     public void reconnect() {
         if (!connecting.compareAndSet(false, true)) {
             return;
         }
 
         updateState(VpnConnectionState.RECONNECTING);
-
-        // 关闭旧连接（不重置退避参数）
         closeSession();
 
-        // 计算重连延迟
         int attempts = reconnectAttempts.incrementAndGet();
         int delay = reconnectDelayMs.get();
 
         Logger.info(LogConfig.MODULE_RECONNECT, "Reconnect attempt " + attempts
                 + ", delay " + delay + "ms");
 
-        // 启动重连线程
         new Thread(() -> {
             try {
                 Thread.sleep(delay);
@@ -202,10 +175,8 @@ public class TunnelManager {
                 if (connect()) {
                     Logger.info(LogConfig.MODULE_RECONNECT, "Reconnect successful");
                 } else {
-                    // 更新延迟（指数退避）
                     int newDelay = Math.min(delay * DELAY_FACTOR, MAX_DELAY_MS);
                     reconnectDelayMs.set(newDelay);
-
                     Logger.warning(LogConfig.MODULE_RECONNECT, "Reconnect failed, next delay: " + newDelay + "ms");
                 }
             } catch (InterruptedException e) {
@@ -215,9 +186,6 @@ public class TunnelManager {
         }, "ReconnectThread").start();
     }
 
-    /**
-     * 断开连接
-     */
     public void disconnect() {
         if (!running) {
             return;
@@ -226,7 +194,6 @@ public class TunnelManager {
         updateState(VpnConnectionState.DISCONNECTING);
         closeSession();
         running = false;
-        // 重置退避参数（仅在用户主动断开时重置）
         reconnectAttempts.set(0);
         reconnectDelayMs.set(INITIAL_DELAY_MS);
         updateState(VpnConnectionState.DISCONNECTED);
@@ -234,9 +201,6 @@ public class TunnelManager {
         Logger.info(LogConfig.MODULE_VPN, "Tunnel disconnected");
     }
 
-    /**
-     * 关闭会话（不重置退避参数）
-     */
     private void closeSession() {
         if (session != null) {
             session.close();
@@ -248,9 +212,6 @@ public class TunnelManager {
         }
     }
 
-    /**
-     * 更新状态
-     */
     private void updateState(VpnConnectionState state) {
         Consumer<VpnConnectionState> cb = stateCallback;
         if (cb != null) {
@@ -258,23 +219,14 @@ public class TunnelManager {
         }
     }
 
-    /**
-     * 获取上传流量
-     */
     public long getUploadBytes() {
         return uploadBytes.get();
     }
 
-    /**
-     * 获取下载流量
-     */
     public long getDownloadBytes() {
         return downloadBytes.get();
     }
 
-    /**
-     * 获取连接时长（秒）
-     */
     public long getConnectionDuration() {
         if (!running) {
             return 0;
@@ -282,23 +234,14 @@ public class TunnelManager {
         return (System.currentTimeMillis() - connectionStartTime.get()) / 1000;
     }
 
-    /**
-     * 检查是否连接
-     */
     public boolean isConnected() {
         return running && session != null && session.isConnected();
     }
 
-    /**
-     * 获取重连次数
-     */
     public int getReconnectAttempts() {
         return reconnectAttempts.get();
     }
 
-    /**
-     * 重置流量统计
-     */
     public void resetStats() {
         uploadBytes.set(0);
         downloadBytes.set(0);

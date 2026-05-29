@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
- * 服务端会话 - 与 C++ KCPSession 一致
+ * 服务端 KCP 会话。
  */
 public class ServerSession {
 
@@ -34,11 +34,6 @@ public class ServerSession {
 
     private Thread updateThread;
 
-    /**
-     * 创建服务端会话
-     * @param clientAddr 客户端地址
-     * @param crypto 加密实例（服务端方向）
-     */
     public ServerSession(InetSocketAddress clientAddr, Crypto crypto) {
         this.sessionId = clientAddr.getAddress().getHostAddress() + ":" + clientAddr.getPort();
         this.clientAddr = clientAddr;
@@ -50,13 +45,11 @@ public class ServerSession {
         this.running = false;
         this.lastActivityTime = new AtomicLong(System.currentTimeMillis());
 
-        // 配置 KCP
         kcp.setNodelay(KcpConfig.NODELAY_ENABLED, KcpConfig.NODELAY_INTERVAL,
                 KcpConfig.NODELAY_RESEND, KcpConfig.NODELAY_NOCWND);
         kcp.setWndSize(KcpConfig.KCP_SNDWND, KcpConfig.KCP_RCVWND);
         kcp.setMtu(KcpConfig.KCP_MTU);
 
-        // 设置输出回调
         kcp.setOutputCallback(new KcpOutputCallback() {
             @Override
             public void onOutput(byte[] data, int len) {
@@ -67,21 +60,13 @@ public class ServerSession {
         Logger.info(LogConfig.MODULE_KCP_SERVER, "ServerSession created: " + sessionId);
     }
 
-    /**
-     * 启动会话
-     */
     public void start() {
         running = true;
         touchActivity();
-
         startUpdateThread();
-
         Logger.info(LogConfig.MODULE_KCP_SERVER, "ServerSession started: " + sessionId);
     }
 
-    /**
-     * 启动 KCP 更新线程
-     */
     private void startUpdateThread() {
         updateThread = new Thread(() -> {
             while (running) {
@@ -89,8 +74,8 @@ public class ServerSession {
                     long nowMs = System.currentTimeMillis();
                     synchronized (kcpLock) {
                         kcp.update((int) (nowMs & 0xFFFFFFFFL));
+                        kcp.flush();
                     }
-
                     Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     break;
@@ -100,9 +85,6 @@ public class ServerSession {
         updateThread.start();
     }
 
-    /**
-     * 处理接收到的数据（已解密）
-     */
     public void receiveData(byte[] decryptedData) {
         if (!running) {
             return;
@@ -122,9 +104,6 @@ public class ServerSession {
         deliverFrames();
     }
 
-    /**
-     * 处理 KCP 输出（加密并回调）
-     */
     private void handleKcpOutput(byte[] data, int len) {
         if (!running || sendCallback == null) {
             return;
@@ -133,7 +112,6 @@ public class ServerSession {
         try {
             byte[] encrypted = crypto.encrypt(data);
             sendCallback.accept(encrypted);
-
             Logger.debug(LogConfig.MODULE_KCP_SERVER, "Output: " + data.length
                     + " plain -> " + encrypted.length + " encrypted");
         } catch (Exception e) {
@@ -158,6 +136,7 @@ public class ServerSession {
             }
 
             kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.flush();
         }
 
         Logger.debug(LogConfig.MODULE_KCP_SERVER, "Sent frame: connectionId="
@@ -201,9 +180,6 @@ public class ServerSession {
         }
     }
 
-    /**
-     * 设置发送回调
-     */
     public void setSendCallback(Consumer<byte[]> callback) {
         this.sendCallback = callback;
     }
@@ -212,36 +188,28 @@ public class ServerSession {
         this.frameHandler = frameHandler;
     }
 
-    /**
-     * 检查是否存活
-     */
     public boolean isAlive() {
-        if (!running) return false;
+        if (!running) {
+            return false;
+        }
         long age = System.currentTimeMillis() - lastActivityTime.get();
         return age < ServerConfig.KCP_TIMEOUT_MS;
     }
 
-    /**
-     * 获取等待发送的数据大小
-     */
     public int waitSend() {
         synchronized (kcpLock) {
             return kcp.waitSend();
         }
     }
 
-    /**
-     * 更新活动时间
-     */
     private void touchActivity() {
         lastActivityTime.set(System.currentTimeMillis());
     }
 
-    /**
-     * 停止会话
-     */
     public void stop() {
-        if (!running) return;
+        if (!running) {
+            return;
+        }
         running = false;
 
         Logger.info(LogConfig.MODULE_KCP_SERVER, "ServerSession stopping: " + sessionId);
@@ -254,16 +222,10 @@ public class ServerSession {
         Logger.info(LogConfig.MODULE_KCP_SERVER, "ServerSession stopped: " + sessionId);
     }
 
-    /**
-     * 获取会话 ID
-     */
     public String getSessionId() {
         return sessionId;
     }
 
-    /**
-     * 获取客户端地址
-     */
     public InetSocketAddress getClientAddr() {
         return clientAddr;
     }

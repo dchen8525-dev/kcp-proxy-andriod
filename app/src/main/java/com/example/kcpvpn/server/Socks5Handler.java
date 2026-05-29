@@ -3,18 +3,20 @@ package com.example.kcpvpn.server;
 import com.example.kcpvpn.core.protocol.AddressParser;
 import com.example.kcpvpn.core.protocol.KcpFrame;
 import com.example.kcpvpn.core.protocol.Socks5;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
 import java.nio.ByteBuffer;
 
 /**
- * Parses the OPEN frame payload, which reuses the existing SOCKS5 CONNECT request format.
+ * 解析 OPEN frame payload。payload 复用现有 SOCKS5 CONNECT 请求格式来携带目标地址。
  */
 public class Socks5Handler {
 
     public static void handleOpenFrame(ServerSession session, KcpFrame frame,
-                                       ServerConnectionManager connectionManager) {
+                                       ServerConnectionManager connectionManager,
+                                       SocketProtector socketProtector) {
         byte[] data = frame.getPayload();
         long connectionId = frame.getConnectionId();
 
@@ -49,7 +51,7 @@ public class Socks5Handler {
             Logger.info(LogConfig.MODULE_SOCKS5, "OPEN frame: connectionId=" + connectionId
                     + ", dst=" + addr.host + ":" + addr.port
                     + ", payloadLength=" + frame.getPayloadLength());
-            connectionManager.openConnection(connectionId, addr.host, addr.port, session);
+            connectionManager.openConnection(connectionId, addr.host, addr.port, session, socketProtector);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_SOCKS5, "Parse OPEN error: connectionId="
                     + connectionId + ", error=" + e.getMessage());

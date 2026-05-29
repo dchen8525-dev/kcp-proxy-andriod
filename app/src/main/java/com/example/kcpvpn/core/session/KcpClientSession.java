@@ -19,8 +19,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
- * KCP 客户端会话 - 与 C++ KCPClientSession 一致
- * 管理 UDP 连接、KCP 协议、加密解密
+ * KCP 客户端会话 - 管理 UDP 连接、KCP 协议、加密解密和 frame 编解码。
  */
 public class KcpClientSession {
 
@@ -41,6 +40,7 @@ public class KcpClientSession {
     private Thread recvThread;
 
     private volatile Consumer<KcpFrame> onFrameReceived;
+    private volatile SocketProtector socketProtector;
 
     public KcpClientSession(String serverHost, int serverPort, Crypto crypto) {
         this.sessionId = "client-" + System.currentTimeMillis();
@@ -54,13 +54,11 @@ public class KcpClientSession {
         this.connected = false;
         this.lastActivityTime = new AtomicLong(System.currentTimeMillis());
 
-        // 配置 KCP
         kcp.setNodelay(KcpConfig.NODELAY_ENABLED, KcpConfig.NODELAY_INTERVAL,
                 KcpConfig.NODELAY_RESEND, KcpConfig.NODELAY_NOCWND);
         kcp.setWndSize(KcpConfig.KCP_SNDWND, KcpConfig.KCP_RCVWND);
         kcp.setMtu(KcpConfig.KCP_MTU);
 
-        // 设置输出回调
         kcp.setOutputCallback(new KcpOutputCallback() {
             @Override
             public void onOutput(byte[] data, int len) {
@@ -68,19 +66,26 @@ public class KcpClientSession {
             }
         });
 
-        Logger.info("kcp_client", "Session created: " + sessionId
+        Logger.info(LogConfig.MODULE_KCP_CLIENT, "Session created: " + sessionId
                 + ", server=" + serverHost + ":" + serverPort);
     }
 
-    /**
-     * 连接到服务端
-     */
+    public void setSocketProtector(SocketProtector protector) {
+        this.socketProtector = protector;
+    }
+
     public boolean connect() {
         Logger.info(LogConfig.MODULE_KCP_CLIENT, "KcpClientSession.connect() begin");
 
         try {
             udpSocket = new DatagramSocket();
             udpSocket.setSoTimeout(1000);
+
+            SocketProtector protector = socketProtector;
+            if (protector != null) {
+                boolean protectedOk = protector.protect(udpSocket);
+                Logger.info(LogConfig.MODULE_KCP_CLIENT, "UDP socket protected: " + protectedOk);
+            }
 
             running = true;
             connected = true;
@@ -90,7 +95,6 @@ public class KcpClientSession {
             startRecvThread();
 
             Logger.info(LogConfig.MODULE_KCP_CLIENT, "Connected to " + serverAddr);
-
             return true;
         } catch (IOException e) {
             Logger.error(LogConfig.MODULE_KCP_CLIENT, "Connect error: " + e.getMessage());
@@ -99,9 +103,6 @@ public class KcpClientSession {
         }
     }
 
-    /**
-     * 启动 KCP 更新线程
-     */
     private void startUpdateThread() {
         updateThread = new Thread(() -> {
             while (running) {
@@ -109,6 +110,7 @@ public class KcpClientSession {
                     long nowMs = System.currentTimeMillis();
                     synchronized (kcpLock) {
                         kcp.update((int) (nowMs & 0xFFFFFFFFL));
+                        kcp.flush();
                     }
                     Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
                 } catch (InterruptedException e) {
@@ -119,9 +121,6 @@ public class KcpClientSession {
         updateThread.start();
     }
 
-    /**
-     * 启动 UDP 接收线程
-     */
     private void startRecvThread() {
         recvThread = new Thread(() -> {
             byte[] recvBuf = new byte[SessionConfig.UDP_RECV_BUF_SIZE];
@@ -139,7 +138,7 @@ public class KcpClientSession {
                     // 正常超时
                 } catch (IOException e) {
                     if (running && connected) {
-                        Logger.error("kcp_client", "UDP receive error: " + e.getMessage());
+                        Logger.error(LogConfig.MODULE_KCP_CLIENT, "UDP receive error: " + e.getMessage());
                     }
                     break;
                 }
@@ -148,9 +147,6 @@ public class KcpClientSession {
         recvThread.start();
     }
 
-    /**
-     * 处理接收到的 UDP 数据
-     */
     private void onReceive(byte[] encryptedData) {
         try {
             byte[] decrypted = crypto.decrypt(encryptedData);
@@ -161,33 +157,35 @@ public class KcpClientSession {
                 ret = kcp.input(decrypted);
             }
             if (ret < 0) {
-                Logger.warning("kcp_client", "ikcp_input rejected packet, ret=" + ret);
+                Logger.warning(LogConfig.MODULE_KCP_CLIENT, "ikcp_input rejected packet, ret=" + ret);
                 return;
             }
 
-            // 如果有数据接收回调且 KCP 中有数据，直接读取
-            tryDeliverData();
+            tryDeliverFrames();
         } catch (Exception e) {
-            Logger.error("kcp_client", "Receive error: " + e.getMessage());
+            Logger.error(LogConfig.MODULE_KCP_CLIENT, "Receive error: " + e.getMessage());
         }
     }
 
-    /**
-     * 尝试将 KCP 接收的数据直接交付给回调
-     */
-    private void tryDeliverData() {
+    private void tryDeliverFrames() {
         Consumer<KcpFrame> cb = onFrameReceived;
-        if (cb == null) return;
+        if (cb == null) {
+            return;
+        }
 
         while (true) {
             byte[] data;
             synchronized (kcpLock) {
                 int peekSize = kcp.peekSize();
-                if (peekSize <= 0) break;
+                if (peekSize <= 0) {
+                    break;
+                }
 
                 byte[] buf = new byte[peekSize];
                 int len = kcp.recv(buf);
-                if (len <= 0) break;
+                if (len <= 0) {
+                    break;
+                }
 
                 data = new byte[len];
                 System.arraycopy(buf, 0, data, 0, len);
@@ -204,9 +202,6 @@ public class KcpClientSession {
         }
     }
 
-    /**
-     * 处理 KCP 输出（加密并发送）
-     */
     private void handleKcpOutput(byte[] data, int len) {
         if (!running || !connected || udpSocket == null) {
             return;
@@ -217,7 +212,7 @@ public class KcpClientSession {
             DatagramPacket packet = new DatagramPacket(encrypted, encrypted.length, serverAddr);
             udpSocket.send(packet);
         } catch (Exception e) {
-            Logger.error("kcp_client", "Encrypt/send error: " + e.getMessage());
+            Logger.error(LogConfig.MODULE_KCP_CLIENT, "Encrypt/send error: " + e.getMessage());
         }
     }
 
@@ -230,11 +225,15 @@ public class KcpClientSession {
         synchronized (kcpLock) {
             int ret = kcp.send(data);
             if (ret < 0) {
-                Logger.warning("kcp_client", "ikcp_send returned " + ret + " (queue may be full)");
+                Logger.warning(LogConfig.MODULE_KCP_CLIENT, "ikcp_send returned " + ret
+                        + " (queue may be full), connectionId=" + frame.getConnectionId()
+                        + ", frameType=" + KcpFrame.frameTypeName(frame.getFrameType())
+                        + ", payloadLength=" + frame.getPayloadLength());
                 return;
             }
 
             kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.flush();
         }
 
         Logger.debug(LogConfig.MODULE_KCP_CLIENT, "Sent frame: connectionId="
@@ -243,66 +242,64 @@ public class KcpClientSession {
                 + frame.getPayloadLength());
     }
 
-    /**
-     * 设置数据接收回调
-     */
     public void setOnFrameReceived(Consumer<KcpFrame> callback) {
         this.onFrameReceived = callback;
     }
 
-    /**
-     * 检查是否连接
-     */
     public boolean isConnected() {
         return connected && running;
     }
 
-    /**
-     * 检查是否存活
-     */
     public boolean isAlive() {
-        if (!running) return false;
+        if (!running) {
+            return false;
+        }
         long age = System.currentTimeMillis() - lastActivityTime.get();
         return age < SessionConfig.KCP_TIMEOUT_MS;
     }
 
     public int waitSend() {
-        return kcp.waitSend();
+        synchronized (kcpLock) {
+            return kcp.waitSend();
+        }
     }
 
     private void touchActivity() {
         lastActivityTime.set(System.currentTimeMillis());
     }
 
-    /**
-     * 关闭会话 — synchronized 防止双重关闭，join 线程确保安全
-     */
     public synchronized void close() {
-        if (!running) return;
+        if (!running) {
+            return;
+        }
         running = false;
         connected = false;
 
-        Logger.info("kcp_client", "Closing session: " + sessionId);
+        Logger.info(LogConfig.MODULE_KCP_CLIENT, "Closing session: " + sessionId);
 
-        // 停止线程
         if (updateThread != null) {
             updateThread.interrupt();
-            try { updateThread.join(1000); } catch (InterruptedException ignored) {}
+            try {
+                updateThread.join(1000);
+            } catch (InterruptedException ignored) {
+            }
             updateThread = null;
         }
         if (recvThread != null) {
             recvThread.interrupt();
-            try { recvThread.join(1000); } catch (InterruptedException ignored) {}
+            try {
+                recvThread.join(1000);
+            } catch (InterruptedException ignored) {
+            }
             recvThread = null;
         }
 
-        // 关闭 socket（会解除 recvThread 的 DatagramSocket.receive 阻塞）
         if (udpSocket != null) {
             udpSocket.close();
             udpSocket = null;
         }
 
-        Logger.info("kcp_client", "Session closed: " + sessionId);
+        Logger.info(LogConfig.MODULE_KCP_CLIENT, "Session closed: " + sessionId);
     }
 
     public String getSessionId() {

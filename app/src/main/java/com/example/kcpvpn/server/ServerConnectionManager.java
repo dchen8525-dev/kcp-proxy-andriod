@@ -2,6 +2,7 @@ package com.example.kcpvpn.server;
 
 import com.example.kcpvpn.core.kcp.KcpConfig;
 import com.example.kcpvpn.core.protocol.KcpFrame;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
@@ -14,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 服务端连接管理器 - 每个 connectionId 对应一个远端 TCP 连接
+ * 服务端连接管理器 - 每个 connectionId 对应一个远端 TCP 连接。
  */
 public class ServerConnectionManager {
 
@@ -24,7 +25,8 @@ public class ServerConnectionManager {
         this.connections = new ConcurrentHashMap<>();
     }
 
-    public boolean openConnection(long connectionId, String host, int port, ServerSession session) {
+    public boolean openConnection(long connectionId, String host, int port, ServerSession session,
+                                  SocketProtector socketProtector) {
         if (connections.containsKey(connectionId)) {
             Logger.warning(LogConfig.MODULE_KCP_SERVER, "OPEN ignored, connection exists: connectionId="
                     + connectionId + ", dst=" + host + ":" + port);
@@ -33,6 +35,10 @@ public class ServerConnectionManager {
 
         Socket socket = new Socket();
         try {
+            if (socketProtector != null) {
+                socketProtector.protect(socket);
+                socketProtector.bindToNetwork(socket);
+            }
             socket.connect(new InetSocketAddress(host, port), ServerConfig.CONNECT_TIMEOUT_MS);
             ServerConnection conn = new ServerConnection(connectionId, session.getSessionId(), host, port, socket);
             connections.put(connectionId, conn);
@@ -85,13 +91,6 @@ public class ServerConnectionManager {
                 + ", payloadLength=0");
     }
 
-    public void closeAll() {
-        for (Long connectionId : connections.keySet()) {
-            closeConnection(connectionId, false);
-        }
-        Logger.info(LogConfig.MODULE_KCP_SERVER, "All connections closed");
-    }
-
     public void closeSessionConnections(String sessionId) {
         for (ServerConnection conn : connections.values()) {
             if (conn.sessionId.equals(sessionId)) {
@@ -99,6 +98,13 @@ public class ServerConnectionManager {
             }
         }
         Logger.info(LogConfig.MODULE_KCP_SERVER, "Session connections closed: sessionId=" + sessionId);
+    }
+
+    public void closeAll() {
+        for (Long connectionId : connections.keySet()) {
+            closeConnection(connectionId, false);
+        }
+        Logger.info(LogConfig.MODULE_KCP_SERVER, "All connections closed");
     }
 
     public int getConnectionCount() {

@@ -1,6 +1,8 @@
 package com.example.kcpvpn.ui.adapters;
 
 import android.graphics.Color;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -22,6 +24,9 @@ import java.util.List;
 public class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
 
     private List<LogEntry> logs;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private static final int MAX_LOGS = 500;
 
     private static final int COLOR_DEBUG = Color.GRAY;
     private static final int COLOR_INFO = 0xFF2196F3;      // 蓝色
@@ -52,28 +57,66 @@ public class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
     }
 
     /**
-     * 添加日志
+     * 添加日志（线程安全，自动切换到主线程）
      */
     public void addLog(LogEntry entry) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            addLogInternal(entry);
+        } else {
+            mainHandler.post(() -> addLogInternal(entry));
+        }
+    }
+
+    private void addLogInternal(LogEntry entry) {
+        if (logs.size() >= MAX_LOGS) {
+            logs.remove(0);
+            notifyItemRemoved(0);
+        }
         logs.add(entry);
         notifyItemInserted(logs.size() - 1);
     }
 
     /**
-     * 更新所有日志
+     * 更新所有日志（线程安全，自动切换到主线程）
      */
     public void updateLogs(List<LogEntry> newLogs) {
-        logs.clear();
-        logs.addAll(newLogs);
-        notifyDataSetChanged();
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            logs.clear();
+            logs.addAll(newLogs);
+            notifyDataSetChanged();
+        } else {
+            mainHandler.post(() -> {
+                logs.clear();
+                logs.addAll(newLogs);
+                notifyDataSetChanged();
+            });
+        }
     }
 
     /**
-     * 清空日志
+     * 清空日志（线程安全，自动切换到主线程）
      */
     public void clear() {
-        logs.clear();
-        notifyDataSetChanged();
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            logs.clear();
+            notifyDataSetChanged();
+        } else {
+            mainHandler.post(() -> {
+                logs.clear();
+                notifyDataSetChanged();
+            });
+        }
+    }
+
+    /**
+     * 获取所有日志的格式化文本（用于复制）
+     */
+    public String getLogsText() {
+        StringBuilder sb = new StringBuilder();
+        for (LogEntry entry : logs) {
+            sb.append(entry.format()).append("\n");
+        }
+        return sb.toString();
     }
 
     /**

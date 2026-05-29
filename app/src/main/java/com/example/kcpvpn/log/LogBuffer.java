@@ -1,41 +1,38 @@
 package com.example.kcpvpn.log;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
 /**
  * 日志内存缓冲区 - 环形缓冲区，用于实时显示
+ * 使用 ArrayDeque 替代 CopyOnWriteArrayList，避免每次 add 都复制整个数组
  */
 public class LogBuffer {
 
     private final int maxSize;
-    private final CopyOnWriteArrayList<LogEntry> entries;
-    private final CopyOnWriteArrayList<Consumer<LogEntry>> listeners;
+    private final Deque<LogEntry> entries;
+    private final List<Consumer<LogEntry>> listeners;
 
     public LogBuffer() {
         this.maxSize = LogConfig.BUFFER_SIZE;
-        this.entries = new CopyOnWriteArrayList<>();
-        this.listeners = new CopyOnWriteArrayList<>();
+        this.entries = new ArrayDeque<>(maxSize);
+        this.listeners = new ArrayList<>();
     }
 
     /**
      * 添加日志条目
      */
-    public void add(LogEntry entry) {
-        entries.add(entry);
-
-        // 如果超出容量，批量移除最旧的
-        if (entries.size() > maxSize) {
-            int excess = entries.size() - maxSize;
-            for (int i = 0; i < excess; i++) {
-                entries.remove(0);
-            }
+    public synchronized void add(LogEntry entry) {
+        if (entries.size() >= maxSize) {
+            entries.removeFirst();
         }
+        entries.addLast(entry);
 
-        // 通知监听器
-        for (Consumer<LogEntry> listener : listeners) {
+        // 通知监听器（复制列表避免并发修改）
+        for (Consumer<LogEntry> listener : new ArrayList<>(listeners)) {
             listener.accept(entry);
         }
     }
@@ -43,14 +40,14 @@ public class LogBuffer {
     /**
      * 获取所有条目
      */
-    public List<LogEntry> getAll() {
+    public synchronized List<LogEntry> getAll() {
         return new ArrayList<>(entries);
     }
 
     /**
      * 获取指定级别的条目
      */
-    public List<LogEntry> getByLevel(LogLevel level) {
+    public synchronized List<LogEntry> getByLevel(LogLevel level) {
         List<LogEntry> result = new ArrayList<>();
         for (LogEntry entry : entries) {
             if (entry.getLevel().getValue() >= level.getValue()) {
@@ -63,28 +60,28 @@ public class LogBuffer {
     /**
      * 清空缓冲区
      */
-    public void clear() {
+    public synchronized void clear() {
         entries.clear();
     }
 
     /**
      * 获取条目数量
      */
-    public int size() {
+    public synchronized int size() {
         return entries.size();
     }
 
     /**
      * 添加监听器
      */
-    public void addListener(Consumer<LogEntry> listener) {
+    public synchronized void addListener(Consumer<LogEntry> listener) {
         listeners.add(listener);
     }
 
     /**
      * 移除监听器
      */
-    public void removeListener(Consumer<LogEntry> listener) {
+    public synchronized void removeListener(Consumer<LogEntry> listener) {
         listeners.remove(listener);
     }
 }

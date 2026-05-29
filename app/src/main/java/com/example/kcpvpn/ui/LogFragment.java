@@ -6,6 +6,9 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import android.os.Bundle;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -14,6 +17,7 @@ import android.widget.AutoCompleteTextView;
 import android.widget.Button;
 
 import com.example.kcpvpn.R;
+import com.google.android.material.snackbar.Snackbar;
 import com.example.kcpvpn.log.LogBuffer;
 import com.example.kcpvpn.log.LogEntry;
 import com.example.kcpvpn.log.LogLevel;
@@ -34,11 +38,14 @@ public class LogFragment extends Fragment {
     private LogAdapter logAdapter;
     private RecyclerView recyclerView;
     private AutoCompleteTextView spinnerLogLevel;
+    private Button btnCopyLog;
     private Button btnClearLog;
 
     // 初始显示所有日志，使用最低级别 DEBUG（value=0）作为"全部"
     private LogLevel currentLogLevel = LogLevel.DEBUG;
     private Consumer<LogEntry> logListener;
+
+    private static final String STATE_LOG_LEVEL = "log_level";
 
     public LogFragment() {
         // Required empty public constructor
@@ -54,21 +61,28 @@ public class LogFragment extends Fragment {
     public void onViewCreated(View view, Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        try {
-            viewModel = new ViewModelProvider(requireActivity()).get(MainViewModel.class);
-        } catch (Exception e) {
-            // Fragment可能还没attach到Activity
-        }
+        viewModel = new ViewModelProvider(requireActivity()).get(MainViewModel.class);
 
         initViews(view);
         setupRecyclerView();
         setupListeners();
+
+        if (savedInstanceState != null) {
+            int levelOrdinal = savedInstanceState.getInt(STATE_LOG_LEVEL, LogLevel.DEBUG.ordinal());
+            for (LogLevel level : LogLevel.values()) {
+                if (level.ordinal() == levelOrdinal) {
+                    currentLogLevel = level;
+                    break;
+                }
+            }
+        }
     }
 
     @Override
     public void onResume() {
         super.onResume();
-        // 添加日志监听器
+        // 添加日志监听器（先移除再添加，防止 onResume 重复调用导致监听器堆积）
+        removeLogListener();
         createLogListener();
         Logger.getInstance().addListener(logListener);
 
@@ -77,9 +91,22 @@ public class LogFragment extends Fragment {
     }
 
     @Override
+    public void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putInt(STATE_LOG_LEVEL, currentLogLevel.ordinal());
+    }
+
+    @Override
     public void onPause() {
         super.onPause();
         // 移除日志监听器
+        removeLogListener();
+    }
+
+    /**
+     * 移除日志监听器
+     */
+    private void removeLogListener() {
         if (logListener != null) {
             Logger.getInstance().removeListener(logListener);
         }
@@ -93,7 +120,8 @@ public class LogFragment extends Fragment {
             WeakReference<LogFragment> weakThis = new WeakReference<>(this);
             logListener = entry -> {
                 LogFragment fragment = weakThis.get();
-                if (fragment != null && fragment.isAdded() && fragment.getActivity() != null) {
+                if (fragment != null && fragment.isAdded() && !fragment.isRemoving()
+                        && fragment.getActivity() != null && !fragment.getActivity().isFinishing()) {
                     if (entry.getLevel().getValue() >= fragment.currentLogLevel.getValue()) {
                         fragment.addLogEntry(entry);
                     }
@@ -108,6 +136,7 @@ public class LogFragment extends Fragment {
     private void initViews(View view) {
         recyclerView = view.findViewById(R.id.recycler_log);
         spinnerLogLevel = view.findViewById(R.id.spinner_log_filter);
+        btnCopyLog = view.findViewById(R.id.btn_copy_log);
         btnClearLog = view.findViewById(R.id.btn_clear_log);
 
         // 设置日志级别下拉：全部=DEBUG最低级, 其他按级别递增
@@ -115,7 +144,23 @@ public class LogFragment extends Fragment {
         ArrayAdapter<String> adapter = new ArrayAdapter<>(requireContext(),
                 android.R.layout.simple_dropdown_item_1line, levels);
         spinnerLogLevel.setAdapter(adapter);
-        spinnerLogLevel.setText(levels[0], false);
+        // 根据恢复的currentLogLevel设置初始显示
+        int levelIndex = 0;
+        switch (currentLogLevel) {
+            case DEBUG:
+                levelIndex = 0;
+                break;
+            case INFO:
+                levelIndex = 2;
+                break;
+            case WARNING:
+                levelIndex = 3;
+                break;
+            case ERROR:
+                levelIndex = 4;
+                break;
+        }
+        spinnerLogLevel.setText(levels[levelIndex], false);
     }
 
     /**
@@ -158,6 +203,8 @@ public class LogFragment extends Fragment {
             refreshLogs();
         });
 
+        btnCopyLog.setOnClickListener(v -> copyLogsToClipboard());
+
         btnClearLog.setOnClickListener(v -> {
             Logger.getInstance().clear();
             if (logAdapter != null) {
@@ -167,24 +214,61 @@ public class LogFragment extends Fragment {
     }
 
     /**
+     * 复制日志到剪贴板
+     */
+    private void copyLogsToClipboard() {
+        if (logAdapter == null || logAdapter.getItemCount() == 0) {
+            showSnackbar("没有日志可复制");
+            return;
+        }
+
+        String logsText = logAdapter.getLogsText();
+        ClipboardManager clipboard = (ClipboardManager) requireContext()
+                .getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            ClipData clip = ClipData.newPlainText("KCP VPN Logs", logsText);
+            clipboard.setPrimaryClip(clip);
+            showSnackbar("已复制 " + logAdapter.getItemCount() + " 条日志到剪贴板");
+        }
+    }
+
+    /**
+     * 安全地显示 Snackbar
+     */
+    private void showSnackbar(String message) {
+        View view = getView();
+        if (view != null && isAdded() && !isRemoving()) {
+            android.app.Activity activity = getActivity();
+            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
+                Snackbar.make(view, message, Snackbar.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    /**
      * 添加日志条目
      */
     private void addLogEntry(LogEntry entry) {
-        if (getActivity() != null && isAdded()) {
-            getActivity().runOnUiThread(() -> {
-                if (logAdapter != null && isAdded()) {
-                    logAdapter.addLog(entry);
-                    recyclerView.scrollToPosition(logAdapter.getItemCount() - 1);
-                }
-            });
+        android.app.Activity activity = getActivity();
+        if (activity == null || !isAdded() || isRemoving() || activity.isFinishing()) {
+            return;
         }
+        activity.runOnUiThread(() -> {
+            if (logAdapter == null || !isAdded() || isRemoving()) {
+                return;
+            }
+            logAdapter.addLog(entry);
+            if (recyclerView != null) {
+                recyclerView.scrollToPosition(logAdapter.getItemCount() - 1);
+            }
+        });
     }
 
     /**
      * 刷新日志
      */
     private void refreshLogs() {
-        if (logAdapter == null) return;
+        if (logAdapter == null || recyclerView == null) return;
 
         List<LogEntry> logs = Logger.getInstance().getBuffer().getByLevel(currentLogLevel);
         logAdapter.updateLogs(logs);

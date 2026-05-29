@@ -38,8 +38,16 @@ public class LogEntry {
         return message;
     }
 
+    private static final java.lang.ThreadLocal<SimpleDateFormat> DATE_FORMAT_HOLDER =
+            new java.lang.ThreadLocal<SimpleDateFormat>() {
+                @Override
+                protected SimpleDateFormat initialValue() {
+                    return new SimpleDateFormat(DATE_FORMAT_PATTERN, Locale.getDefault());
+                }
+            };
+
     private static String formatTimestamp(long ts) {
-        return new SimpleDateFormat(DATE_FORMAT_PATTERN, Locale.getDefault()).format(new Date(ts));
+        return DATE_FORMAT_HOLDER.get().format(new Date(ts));
     }
 
     /**

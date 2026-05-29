@@ -65,6 +65,23 @@ public class Logger {
         if (writer != null) {
             writer.write(entry);
         }
+
+        // 同时输出到 Android Logcat
+        String tag = "KCPVPN_" + module;
+        switch (level) {
+            case DEBUG:
+                android.util.Log.d(tag, message);
+                break;
+            case INFO:
+                android.util.Log.i(tag, message);
+                break;
+            case WARNING:
+                android.util.Log.w(tag, message);
+                break;
+            case ERROR:
+                android.util.Log.e(tag, message);
+                break;
+        }
     }
 
     /**

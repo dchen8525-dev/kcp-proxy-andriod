@@ -42,12 +42,9 @@
 app_path=$0
 
 # Need this for daisy-chained symlinks.
-while
+while [ -h "$app_path" ]; do
     APP_HOME=${app_path%"${app_path##*/}"}  # leaves a trailing /; ok if empty
     app_path=$(ls -d "$APP_HOME/$app_path" 2>/dev/null || echo "$APP_HOME/$app_path")
-    test -h "$app_path"
-do
-    # Is a link!
 done
 
 # This is normally empty
