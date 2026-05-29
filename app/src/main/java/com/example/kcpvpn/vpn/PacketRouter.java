@@ -20,11 +20,13 @@ public class PacketRouter {
     private static final long CLOSING_IDLE_TIMEOUT_MS = 30 * 1000L;
     private static final int TCP_IPV4_HEADER_LEN = 40;
     private static final int MAX_TCP_PAYLOAD_PER_PACKET = VpnConfig.VPN_MTU - TCP_IPV4_HEADER_LEN;
+    private static final int UDP_TRACE_SAMPLE_RATE = 64;
 
     private final Map<String, TcpConnection> connectionsByKey = new ConcurrentHashMap<>();
     private final Map<Long, TcpConnection> connectionsById = new ConcurrentHashMap<>();
     private final AtomicLong nextConnectionId = new AtomicLong(System.currentTimeMillis());
     private final AtomicLong nextTcpSequence = new AtomicLong(System.nanoTime());
+    private final AtomicLong udpTraceCounter = new AtomicLong(0);
     private volatile boolean running;
     private volatile boolean localMode;
     private volatile SocketProtector socketProtector;
@@ -282,10 +284,10 @@ public class PacketRouter {
         if (payloadLen <= 0 || udpOffset + 8 + payloadLen > totalLen) {
             return;
         }
-        Logger.info(LogConfig.MODULE_VPN, "UDP IN src=" + addressToString(srcAddr) + ":" + srcPort
+        logUdpTrace("UDP IN src=" + addressToString(srcAddr) + ":" + srcPort
                 + " dst=" + addressToString(dstAddr) + ":" + dstPort
                 + " dstPort=" + dstPort
-                + " len=" + payloadLen);
+                + " len=" + payloadLen, srcPort, dstPort);
         byte[] udpPayload = new byte[payloadLen];
         System.arraycopy(packet, udpOffset + 8, udpPayload, 0, payloadLen);
         sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0,
@@ -311,10 +313,10 @@ public class PacketRouter {
                 byte[] udpPacket = buildUdpPacket(datagram.payload, datagram.dstAddr,
                         datagram.dstPort, datagram.srcAddr, datagram.srcPort);
                 writePacketCallback.onWritePacket(udpPacket);
-                Logger.info(LogConfig.MODULE_VPN, "UDP OUT src=" + addressToString(datagram.dstAddr)
+                logUdpTrace("UDP OUT src=" + addressToString(datagram.dstAddr)
                         + ":" + datagram.dstPort
                         + " dst=" + addressToString(datagram.srcAddr) + ":" + datagram.srcPort
-                        + " len=" + datagram.payload.length);
+                        + " len=" + datagram.payload.length, datagram.dstPort, datagram.srcPort);
                 String message = "UDP response: src="
                         + addressToString(datagram.dstAddr) + ":" + datagram.dstPort
                         + ", dst=" + addressToString(datagram.srcAddr) + ":" + datagram.srcPort
@@ -557,6 +559,13 @@ public class PacketRouter {
                 + " seq=" + (seq & 0xFFFFFFFFL)
                 + " ack=" + (ack & 0xFFFFFFFFL)
                 + " len=" + len);
+    }
+
+    private void logUdpTrace(String message, int srcPort, int dstPort) {
+        if (srcPort == 53 || dstPort == 53
+                || udpTraceCounter.incrementAndGet() % UDP_TRACE_SAMPLE_RATE == 0) {
+            Logger.info(LogConfig.MODULE_VPN, message);
+        }
     }
 
     private void startCleanupThread() {

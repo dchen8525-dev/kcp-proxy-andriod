@@ -13,6 +13,8 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -26,9 +28,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class LocalKcpServer {
 
     private static volatile SocketProtector socketProtector;
+    private static final String[] DNS_DIAGNOSTIC_DOMAINS = {
+            "mozilla.org",
+            "cloudflare.com",
+            "python.org",
+            "kernel.org",
+            "openai.com",
+            "youtube.com",
+            "reddit.com"
+    };
 
     public static void setSocketProtector(SocketProtector protector) {
         socketProtector = protector;
+        if (protector != null) {
+            Thread thread = new Thread(() -> runDnsDiagnostics(protector), "DNS-Diagnostics");
+            thread.setDaemon(true);
+            thread.start();
+        }
     }
 
     private final String host;
@@ -273,6 +289,91 @@ public class LocalKcpServer {
         } else {
             Logger.debug(LogConfig.MODULE_KCP_SERVER, message);
         }
+    }
+
+    private static void runDnsDiagnostics(SocketProtector protector) {
+        for (String domain : DNS_DIAGNOSTIC_DOMAINS) {
+            long start = System.currentTimeMillis();
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.setSoTimeout(3000);
+                boolean protectedOk = protector.protect(socket);
+                Logger.info(LogConfig.MODULE_KCP_SERVER, "protect dns udp socket=" + protectedOk);
+                if (!protectedOk) {
+                    Logger.warning(LogConfig.MODULE_KCP_SERVER, "TEST DNS " + domain
+                            + " FAIL reason=protect_failed");
+                    continue;
+                }
+
+                byte[] query = buildDnsQuery(domain, (int) (System.nanoTime() & 0xFFFF));
+                DatagramPacket request = new DatagramPacket(query, query.length,
+                        InetAddress.getByName("1.1.1.1"), 53);
+                socket.send(request);
+
+                byte[] buf = new byte[512];
+                DatagramPacket response = new DatagramPacket(buf, buf.length);
+                socket.receive(response);
+                boolean ok = isDnsSuccess(query, response.getData(), response.getLength());
+                long elapsed = System.currentTimeMillis() - start;
+                if (ok) {
+                    Logger.info(LogConfig.MODULE_KCP_SERVER, "TEST DNS " + domain
+                            + " PASS timeMs=" + elapsed);
+                } else {
+                    Logger.warning(LogConfig.MODULE_KCP_SERVER, "TEST DNS " + domain
+                            + " FAIL reason=bad_response timeMs=" + elapsed);
+                }
+            } catch (Exception e) {
+                long elapsed = System.currentTimeMillis() - start;
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "TEST DNS " + domain
+                        + " FAIL reason=" + e.getClass().getSimpleName()
+                        + ":" + e.getMessage() + " timeMs=" + elapsed);
+            }
+        }
+    }
+
+    private static byte[] buildDnsQuery(String domain, int transactionId) {
+        byte[] name = encodeDnsName(domain);
+        ByteBuffer buf = ByteBuffer.allocate(12 + name.length + 4).order(ByteOrder.BIG_ENDIAN);
+        buf.putShort((short) transactionId);
+        buf.putShort((short) 0x0100);
+        buf.putShort((short) 1);
+        buf.putShort((short) 0);
+        buf.putShort((short) 0);
+        buf.putShort((short) 0);
+        buf.put(name);
+        buf.putShort((short) 1);
+        buf.putShort((short) 1);
+        return buf.array();
+    }
+
+    private static byte[] encodeDnsName(String domain) {
+        String[] labels = domain.split("\\.");
+        int len = 1;
+        for (String label : labels) {
+            len += 1 + label.length();
+        }
+        byte[] out = new byte[len];
+        int pos = 0;
+        for (String label : labels) {
+            out[pos++] = (byte) label.length();
+            for (int i = 0; i < label.length(); i++) {
+                out[pos++] = (byte) label.charAt(i);
+            }
+        }
+        out[pos] = 0;
+        return out;
+    }
+
+    private static boolean isDnsSuccess(byte[] query, byte[] response, int length) {
+        if (length < 12 || query.length < 2) {
+            return false;
+        }
+        if (response[0] != query[0] || response[1] != query[1]) {
+            return false;
+        }
+        int flags = ((response[2] & 0xFF) << 8) | (response[3] & 0xFF);
+        int rcode = flags & 0x0F;
+        int answerCount = ((response[6] & 0xFF) << 8) | (response[7] & 0xFF);
+        return (flags & 0x8000) != 0 && rcode == 0 && answerCount > 0;
     }
 
     private void sendToClient(InetSocketAddress clientAddr, byte[] data) {
