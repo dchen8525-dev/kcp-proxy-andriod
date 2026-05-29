@@ -2,6 +2,7 @@ package com.example.kcpvpn.vpn;
 
 import com.example.kcpvpn.core.crypto.Crypto;
 import com.example.kcpvpn.core.session.KcpClientSession;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.core.session.SessionConfig;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
@@ -47,6 +48,7 @@ public class TunnelManager {
     // 状态回调
     private volatile Consumer<VpnConnectionState> stateCallback;
     private volatile Consumer<byte[]> dataReceivedCallback;
+    private volatile SocketProtector socketProtector;
 
     public TunnelManager(String serverHost, int serverPort, String key) {
         this.serverHost = serverHost;
@@ -81,14 +83,21 @@ public class TunnelManager {
     }
 
     /**
+     * 设置 socket 保护器
+     */
+    public void setSocketProtector(SocketProtector protector) {
+        this.socketProtector = protector;
+    }
+
+    /**
      * 连接阧道
      * @return true 成功
      */
     public boolean connect() {
         Logger.info(LogConfig.MODULE_VPN, "TunnelManager.connect() begin");
 
-        if (running || !connecting.compareAndSet(false, true)) {
-            Logger.warning(LogConfig.MODULE_VPN, "Already connecting or connected, running=" + running);
+        if (running) {
+            Logger.warning(LogConfig.MODULE_VPN, "Already connected, running=" + running);
             return false;
         }
 
@@ -105,6 +114,13 @@ public class TunnelManager {
             session = new KcpClientSession(serverHost, serverPort, crypto);
             Logger.info(LogConfig.MODULE_VPN, "KcpClientSession created");
 
+            // 设置 socket 保护器（VPN 场景下防止路由循环）
+            SocketProtector protector = socketProtector;
+            if (protector != null) {
+                session.setSocketProtector(protector);
+                Logger.info(LogConfig.MODULE_VPN, "SocketProtector set for KcpClientSession");
+            }
+
             session.setOnDataReceived(data -> {
                 Consumer<byte[]> cb = dataReceivedCallback;
                 if (cb != null) {
@@ -117,7 +133,6 @@ public class TunnelManager {
             Logger.info(LogConfig.MODULE_VPN, "Calling session.connect()...");
             if (!session.connect()) {
                 Logger.error(LogConfig.MODULE_VPN, "KCP session.connect() returned false");
-                connecting.set(false);
                 updateState(VpnConnectionState.DISCONNECTED);
                 return false;
             }
@@ -125,7 +140,6 @@ public class TunnelManager {
             Logger.info(LogConfig.MODULE_VPN, "KCP session connected");
 
             running = true;
-            connecting.set(false);
             reconnectAttempts.set(0);
             reconnectDelayMs.set(INITIAL_DELAY_MS);
             connectionStartTime.set(System.currentTimeMillis());
@@ -138,7 +152,6 @@ public class TunnelManager {
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "Connect error: " + e.getMessage());
             e.printStackTrace();
-            connecting.set(false);
             updateState(VpnConnectionState.DISCONNECTED);
             return false;
         }
@@ -187,11 +200,7 @@ public class TunnelManager {
      */
     public void checkConnection() {
         KcpClientSession s = session;
-        if (!running || s == null) {
-            return;
-        }
-
-        if (!s.isAlive() || !s.isConnected()) {
+        if (s == null || !s.isAlive() || !s.isConnected()) {
             Logger.warning(LogConfig.MODULE_VPN, "Connection lost, triggering reconnect");
             reconnect();
         }
@@ -208,7 +217,8 @@ public class TunnelManager {
 
         updateState(VpnConnectionState.RECONNECTING);
 
-        // 关闭旧连接（不重置退避参数）
+        // 关闭旧连接（不重置退避参数），必须将 running 设为 false 否则 connect() 会拒绝
+        running = false;
         closeSession();
 
         // 计算重连延迟

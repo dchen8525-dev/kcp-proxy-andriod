@@ -9,7 +9,7 @@ import com.example.kcpvpn.core.session.SessionConfig;
 public class ServerConfig {
     // 超时参数
     public static final int KCP_TIMEOUT_MS = KcpConfig.KCP_TIMEOUT_SEC * 1000;
-    public static final int CONNECT_TIMEOUT_MS = 15 * 1000;
+    public static final int CONNECT_TIMEOUT_MS = 5 * 1000;
     public static final int CLEANUP_INTERVAL_MS = 30 * 1000;
 
     // 最大会话数

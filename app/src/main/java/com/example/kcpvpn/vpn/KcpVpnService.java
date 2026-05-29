@@ -14,8 +14,10 @@ import android.os.ParcelFileDescriptor;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.example.kcpvpn.R;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
+import com.example.kcpvpn.server.LocalKcpServer;
 import com.example.kcpvpn.ui.MainActivity;
 
 import java.io.FileInputStream;
@@ -42,6 +44,7 @@ public class KcpVpnService extends VpnService {
     private PacketRouter packetRouter;
 
     private Thread vpnReadThread;
+    private Thread healthCheckThread;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile VpnConnectionState connectionState;
@@ -233,9 +236,9 @@ public class KcpVpnService extends VpnService {
                     .setMtu(VpnConfig.VPN_MTU)
                     .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
                     .addRoute("0.0.0.0", 0)
-                    .addDnsServer("8.8.8.8")
-                    .addDnsServer("8.8.4.4")
-                    .addDisallowedApplication(getPackageName());  // 排除自身，避免流量循环
+                    // 使用 emulator 默认 DNS（不保护 socket，让流量走本地网络）
+                    .addDnsServer("10.0.2.3")
+                    .addDisallowedApplication(getPackageName());
 
             vpnInterface = builder.establish();
 
@@ -261,6 +264,57 @@ public class KcpVpnService extends VpnService {
             // 创建隧道管理器
             Logger.info(LogConfig.MODULE_VPN, "Creating TunnelManager: " + serverHost + ":" + serverPort);
             tunnelManager = new TunnelManager(serverHost, serverPort, key);
+            SocketProtector protector = new SocketProtector() {
+                @Override
+                public boolean protect(java.net.DatagramSocket socket) {
+                    boolean ok = KcpVpnService.this.protect(socket);
+                    Logger.info(LogConfig.MODULE_VPN, "Protected UDP socket: " + ok);
+                    return ok;
+                }
+
+                @Override
+                public boolean protect(java.net.Socket socket) {
+                    boolean ok = KcpVpnService.this.protect(socket);
+                    Logger.info(LogConfig.MODULE_VPN, "Protected TCP socket: " + ok);
+                    return ok;
+                }
+
+                @Override
+                public boolean protect(int fd) {
+                    boolean ok = KcpVpnService.this.protect(fd);
+                    Logger.info(LogConfig.MODULE_VPN, "Protected socket fd=" + fd + ": " + ok);
+                    return ok;
+                }
+
+                @Override
+                public void bindToNetwork(java.net.Socket socket) throws java.io.IOException {
+                    android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                    if (cm == null) {
+                        Logger.warning(LogConfig.MODULE_VPN, "ConnectivityManager is null, cannot bind socket to network");
+                        return;
+                    }
+                    android.net.Network[] networks = cm.getAllNetworks();
+                    for (android.net.Network network : networks) {
+                        android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+                        if (caps != null
+                                && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                                && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                            network.bindSocket(socket);
+                            Logger.info(LogConfig.MODULE_VPN, "Socket bound to underlying network: " + network);
+                            return;
+                        }
+                    }
+                    Logger.warning(LogConfig.MODULE_VPN, "No underlying network found for socket binding");
+                }
+            };
+            tunnelManager.setSocketProtector(protector);
+
+            // 本地模式下，为 LocalKcpServer 设置 socket 保护器
+            if (localMode) {
+                LocalKcpServer.setSocketProtector(protector);
+                Logger.info(LogConfig.MODULE_VPN, "LocalKcpServer SocketProtector set");
+            }
+
             tunnelManager.setStateCallback(state -> {
                 Logger.info(LogConfig.MODULE_VPN, "Tunnel state changed: " + state.getDisplayText());
                 connectionState = state;
@@ -274,6 +328,8 @@ public class KcpVpnService extends VpnService {
             // 创建数据包路由器
             Logger.info(LogConfig.MODULE_VPN, "Creating PacketRouter");
             packetRouter = new PacketRouter();
+            packetRouter.setSocketProtector(protector);
+            packetRouter.setLocalMode(localMode);
             packetRouter.start();
 
             // 连接隧道
@@ -292,6 +348,9 @@ public class KcpVpnService extends VpnService {
 
             // 启动读取线程
             startVpnReadThread();
+
+            // 启动健康检查线程
+            startHealthCheckThread();
 
             connectionStartTime = System.currentTimeMillis();
 
@@ -357,6 +416,25 @@ public class KcpVpnService extends VpnService {
             }
         }, "VPN-Read");
         vpnReadThread.start();
+    }
+
+    /**
+     * 启动健康检查线程 — 每 5 秒检测隧道活性，死连接触发重连
+     */
+    private void startHealthCheckThread() {
+        healthCheckThread = new Thread(() -> {
+            while (running.get()) {
+                try {
+                    Thread.sleep(5000);
+                    if (tunnelManager != null) {
+                        tunnelManager.checkConnection();
+                    }
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }, "Health-Check");
+        healthCheckThread.start();
     }
 
     /**
@@ -428,6 +506,17 @@ public class KcpVpnService extends VpnService {
                 Thread.currentThread().interrupt();
             }
             vpnReadThread = null;
+        }
+
+        // 停止健康检查线程
+        if (healthCheckThread != null) {
+            healthCheckThread.interrupt();
+            try {
+                healthCheckThread.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            healthCheckThread = null;
         }
 
         vpnInputStream = null;

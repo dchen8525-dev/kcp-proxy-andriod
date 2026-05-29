@@ -38,6 +38,7 @@ public class KcpClientSession {
     private volatile boolean handshakeDone;
 
     private final AtomicLong lastActivityTime;
+    private final AtomicLong lastSendTime;
 
     private Thread updateThread;
     private Thread recvThread;
@@ -50,6 +51,7 @@ public class KcpClientSession {
     private volatile Consumer<byte[]> pendingReadHandler;
 
     private volatile Consumer<byte[]> onDataReceived;
+    private volatile SocketProtector socketProtector;
 
     public KcpClientSession(String serverHost, int serverPort, Crypto crypto) {
         this.sessionId = "client-" + System.currentTimeMillis();
@@ -61,6 +63,7 @@ public class KcpClientSession {
         this.connected = false;
         this.handshakeDone = false;
         this.lastActivityTime = new AtomicLong(System.currentTimeMillis());
+        this.lastSendTime = new AtomicLong(System.currentTimeMillis());
 
         // 配置 KCP
         kcp.setNodelay(KcpConfig.NODELAY_ENABLED, KcpConfig.NODELAY_INTERVAL,
@@ -81,6 +84,13 @@ public class KcpClientSession {
     }
 
     /**
+     * 设置 socket 保护器（VPN 场景下防止路由循环）
+     */
+    public void setSocketProtector(SocketProtector protector) {
+        this.socketProtector = protector;
+    }
+
+    /**
      * 连接到服务端
      */
     public boolean connect() {
@@ -89,6 +99,13 @@ public class KcpClientSession {
         try {
             udpSocket = new DatagramSocket();
             udpSocket.setSoTimeout(1000);
+
+            // VPN 场景下保护 socket 不被 VPN 路由循环
+            SocketProtector protector = socketProtector;
+            if (protector != null) {
+                boolean protectedOk = protector.protect(udpSocket);
+                Logger.info(LogConfig.MODULE_KCP_CLIENT, "UDP socket protected: " + protectedOk);
+            }
 
             running = true;
             connected = true;
@@ -217,6 +234,7 @@ public class KcpClientSession {
             byte[] encrypted = crypto.encrypt(data);
             DatagramPacket packet = new DatagramPacket(encrypted, encrypted.length, serverAddr);
             udpSocket.send(packet);
+            touchSendActivity();
         } catch (Exception e) {
             Logger.error("kcp_client", "Encrypt/send error: " + e.getMessage());
         }
@@ -239,6 +257,7 @@ public class KcpClientSession {
 
             kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
             kcp.flush();
+            touchSendActivity();
         }
     }
 
@@ -328,12 +347,14 @@ public class KcpClientSession {
     }
 
     /**
-     * 检查是否存活
+     * 检查是否存活 — 双向活动检测
      */
     public boolean isAlive() {
         if (!running) return false;
-        long age = System.currentTimeMillis() - lastActivityTime.get();
-        return age < SessionConfig.KCP_TIMEOUT_MS;
+        long now = System.currentTimeMillis();
+        long recvAge = now - lastActivityTime.get();
+        long sendAge = now - lastSendTime.get();
+        return recvAge < SessionConfig.KCP_TIMEOUT_MS && sendAge < SessionConfig.KCP_TIMEOUT_MS;
     }
 
     public int waitSend() {
@@ -342,6 +363,10 @@ public class KcpClientSession {
 
     private void touchActivity() {
         lastActivityTime.set(System.currentTimeMillis());
+    }
+
+    private void touchSendActivity() {
+        lastSendTime.set(System.currentTimeMillis());
     }
 
     /**

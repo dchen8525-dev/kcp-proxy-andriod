@@ -4,30 +4,41 @@ import com.example.kcpvpn.core.kcp.KcpConfig;
 import com.example.kcpvpn.core.protocol.AddressParser;
 import com.example.kcpvpn.core.protocol.Socks5;
 import com.example.kcpvpn.core.protocol.Socks5Response;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * SOCKS5 处理器 - 与 C++ handle_socks5_request 一致
+ * 支持多路复用：每个连接带 1-byte connId 前缀
  */
 public class Socks5Handler {
 
+    // 连接线程池，避免阻塞 SOCKS5 读取循环
+    private static final ExecutorService connectPool = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "Socks5-Connect");
+        t.setDaemon(true);
+        return t;
+    });
+
     /**
      * 处理 SOCKS5 请求
-     * @param session 服务端会话
-     * @param data SOCKS5 请求数据
-     * @param connectionManager 连接管理器
      */
-    public static void handleRequest(ServerSession session, byte[] data,
-                                     ServerConnectionManager connectionManager) {
+    public static void handleRequest(ServerSession session, int connId, byte[] data,
+                                     ServerConnectionManager connectionManager,
+                                     SocketProtector socketProtector) {
         if (data == null || data.length < 4) {
             Logger.warning(LogConfig.MODULE_SOCKS5, "SOCKS5 request too short");
-            sendReply(session, Socks5.SOCKS5_REPLY_GENERAL_FAILURE);
+            sendReply(session, connId, Socks5.SOCKS5_REPLY_GENERAL_FAILURE);
             return;
         }
 
@@ -40,7 +51,7 @@ public class Socks5Handler {
 
         if (ver != Socks5.SOCKS5_VERSION) {
             Logger.warning(LogConfig.MODULE_SOCKS5, "Invalid SOCKS5 version: " + ver);
-            sendReply(session, Socks5.SOCKS5_REPLY_GENERAL_FAILURE);
+            sendReply(session, connId, Socks5.SOCKS5_REPLY_GENERAL_FAILURE);
             return;
         }
 
@@ -49,72 +60,80 @@ public class Socks5Handler {
 
             if (addr.host == null || addr.host.isEmpty()) {
                 Logger.warning(LogConfig.MODULE_SOCKS5, "Empty host in SOCKS5 request");
-                sendReply(session, Socks5.SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED);
+                sendReply(session, connId, Socks5.SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED);
                 return;
             }
 
             Logger.info(LogConfig.MODULE_SOCKS5, "SOCKS5 request: cmd=" + cmd
-                    + ", host=" + addr.host + ", port=" + addr.port);
+                    + ", host=" + addr.host + ", port=" + addr.port + ", connId=" + connId);
 
             if (cmd == Socks5.SOCKS5_CMD_CONNECT) {
-                handleConnect(session, addr.host, addr.port, connectionManager);
+                final ServerSession sess = session;
+                final ServerConnectionManager mgr = connectionManager;
+                final SocketProtector prot = socketProtector;
+                final int cid = connId;
+                connectPool.execute(() -> {
+                    doConnect(sess, cid, addr.host, addr.port, mgr, prot);
+                });
             } else if (cmd == Socks5.SOCKS5_CMD_UDP_ASSOCIATE) {
                 Logger.warning(LogConfig.MODULE_SOCKS5, "UDP ASSOCIATE not supported");
-                sendReply(session, Socks5.SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
+                sendReply(session, connId, Socks5.SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
             } else {
                 Logger.warning(LogConfig.MODULE_SOCKS5, "Unsupported command: " + cmd);
-                sendReply(session, Socks5.SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
+                sendReply(session, connId, Socks5.SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
             }
 
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_SOCKS5, "Parse SOCKS5 request error: " + e.getMessage());
-            sendReply(session, Socks5.SOCKS5_REPLY_GENERAL_FAILURE);
+            sendReply(session, connId, Socks5.SOCKS5_REPLY_GENERAL_FAILURE);
         }
     }
 
     /**
-     * 处理 CONNECT 命令
+     * 执行 TCP 连接（在线程池中运行）
      */
-    private static void handleConnect(ServerSession session, String host, int port,
-                                      ServerConnectionManager connectionManager) {
-        Logger.info(LogConfig.MODULE_SOCKS5, "Connecting to " + host + ":" + port);
+    private static void doConnect(ServerSession session, int connId, String host, int port,
+                                  ServerConnectionManager connectionManager,
+                                  SocketProtector socketProtector) {
+        Logger.info(LogConfig.MODULE_SOCKS5, "Connecting to " + host + ":" + port + " connId=" + connId);
 
-        // 创建 TCP 连接
         Socket tcpSocket = new Socket();
         try {
+            // addDisallowedApplication 已让本应用流量绕过 VPN，无需 protect()
+            // emulator 中 bind() + protect() 组合会导致外部连接失败
+            Logger.info(LogConfig.MODULE_SOCKS5, "Calling connect to " + host + ":" + port);
+
             tcpSocket.connect(new InetSocketAddress(host, port), ServerConfig.CONNECT_TIMEOUT_MS);
+            Logger.info(LogConfig.MODULE_SOCKS5, "Connect to " + host + ":" + port + " succeeded");
 
-            // 注册连接
-            connectionManager.registerConnection(session.getSessionId(), tcpSocket);
-
-            // 发送成功响应
-            sendSuccessReply(session, host, port);
-
+            // 连接成功 → 注册并启动转发
+            connectionManager.registerConnection(session.getSessionId(), connId, tcpSocket);
+            sendSuccessReply(session, connId, host, port);
             session.markHandshakeDone();
-
-            Logger.info(LogConfig.MODULE_SOCKS5, "Connected to " + host + ":" + port);
-
-            // 开始双向转发
-            startForwarding(session, tcpSocket, connectionManager);
+            Logger.info(LogConfig.MODULE_SOCKS5, "Connected to " + host + ":" + port + " connId=" + connId);
+            startForwarding(session, connId, tcpSocket, connectionManager, socketProtector);
 
         } catch (IOException e) {
-            Logger.error(LogConfig.MODULE_SOCKS5, "Connect to target failed: " + e.getMessage());
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            Logger.error(LogConfig.MODULE_SOCKS5, "Connect to target failed: " + e.getClass().getName()
+                    + ": " + e.getMessage());
             byte replyCode = getErrorReplyCode(e);
-            sendReply(session, replyCode);
+            sendReply(session, connId, replyCode);
         }
     }
 
     /**
      * 开始双向转发
      */
-    private static void startForwarding(ServerSession session, Socket tcpSocket,
-                                         ServerConnectionManager connectionManager) {
+    private static void startForwarding(ServerSession session, int connId, Socket tcpSocket,
+                                         ServerConnectionManager connectionManager,
+                                         SocketProtector socketProtector) {
         // TCP -> KCP 转发线程
         Thread tcpToKcpThread = new Thread(() -> {
             byte[] buffer = new byte[ServerConfig.FWD_BUF_SIZE];
             try {
                 while (session.isAlive() && tcpSocket.isConnected() && !tcpSocket.isClosed()) {
-                    // 背压控制
                     if (session.waitSend() >= ServerConfig.BACKPRESSURE_THRESHOLD) {
                         Thread.sleep(KcpConfig.KCP_INTERVAL_MS * 4);
                         continue;
@@ -127,68 +146,125 @@ public class Socks5Handler {
 
                     byte[] data = new byte[len];
                     System.arraycopy(buffer, 0, data, 0, len);
-                    session.sendData(data);
+                    session.sendData(wrapWithConnId(connId, data));
 
-                    Logger.debug(LogConfig.MODULE_KCP_SERVER, "TCP -> KCP: " + len + " bytes");
+                    Logger.debug(LogConfig.MODULE_KCP_SERVER, "TCP -> KCP: " + len + " bytes connId=" + connId);
                 }
             } catch (IOException | InterruptedException e) {
                 Logger.debug(LogConfig.MODULE_KCP_SERVER, "TCP read ended: " + e.getMessage());
             }
 
-            connectionManager.closeConnection(session.getSessionId());
-        }, "TCP-to-KCP-" + session.getSessionId());
+            connectionManager.closeConnection(session.getSessionId(), connId);
+        }, "TCP-to-KCP-" + session.getSessionId() + "-" + connId);
         tcpToKcpThread.start();
 
-        // KCP -> TCP 转发线程（回调递归模式，避免覆盖 pendingReadHandler）
-        Thread kcpToTcpThread = new Thread(() -> {
-            forwardKcpToTcpRecursive(session, tcpSocket, connectionManager);
-        }, "KCP-to-TCP-" + session.getSessionId());
-        kcpToTcpThread.start();
+        // 启动会话级 KCP 分发器（仅一次）
+        if (session.trySetForwardReadPending()) {
+            dispatchKcpToTcp(session, connectionManager, socketProtector);
+        }
     }
 
     /**
-     * 递归转发 KCP -> TCP（回调完成后再发起下一次读取，避免覆盖 pendingReadHandler）
+     * 会话级 KCP 分发器：读取所有 KCP 数据并按 connId 路由
      */
-    private static void forwardKcpToTcpRecursive(ServerSession session, Socket tcpSocket,
-                                                   ServerConnectionManager connectionManager) {
-        if (!session.isAlive() || tcpSocket.isClosed()) {
-            connectionManager.closeConnection(session.getSessionId());
-            return;
-        }
-
+    private static void dispatchKcpToTcp(ServerSession session,
+                                          ServerConnectionManager connectionManager,
+                                          SocketProtector socketProtector) {
         final byte[] buffer = new byte[ServerConfig.FWD_BUF_SIZE];
         session.asyncReadSome(buffer, data -> {
             if (data == null || data.length == 0) {
-                connectionManager.closeConnection(session.getSessionId());
+                connectionManager.closeAllForSession(session.getSessionId());
+                return;
+            }
+            if (data.length < 1) {
+                dispatchKcpToTcp(session, connectionManager, socketProtector);
                 return;
             }
 
-            try {
-                tcpSocket.getOutputStream().write(data);
-                Logger.debug(LogConfig.MODULE_KCP_SERVER, "KCP -> TCP: " + data.length + " bytes");
-                // 递归调用，发起下一次读取
-                forwardKcpToTcpRecursive(session, tcpSocket, connectionManager);
-            } catch (IOException e) {
-                Logger.error(LogConfig.MODULE_KCP_SERVER, "TCP write error: " + e.getMessage());
-                connectionManager.closeConnection(session.getSessionId());
+            int connId = data[0] & 0xFF;
+            byte[] payload = new byte[data.length - 1];
+            System.arraycopy(data, 1, payload, 0, payload.length);
+
+            // 检测新的 SOCKS5 请求
+            if (payload.length >= 4 && payload[0] == Socks5.SOCKS5_VERSION
+                    && payload[1] == Socks5.SOCKS5_CMD_CONNECT) {
+                Logger.info(LogConfig.MODULE_SOCKS5, "Detected new SOCKS5 CONNECT connId=" + connId);
+                Socks5Handler.handleRequest(session, connId, payload, connectionManager, socketProtector);
+            } else {
+                Socket socket = connectionManager.getConnection(session.getSessionId(), connId);
+                if (socket != null && !socket.isClosed()) {
+                    try {
+                        socket.getOutputStream().write(payload);
+                        Logger.debug(LogConfig.MODULE_KCP_SERVER, "KCP -> TCP: " + payload.length + " bytes connId=" + connId);
+                    } catch (IOException e) {
+                        Logger.error(LogConfig.MODULE_KCP_SERVER, "TCP write error connId=" + connId + ": " + e.getMessage());
+                        connectionManager.closeConnection(session.getSessionId(), connId);
+                    }
+                } else {
+                    Logger.warning(LogConfig.MODULE_KCP_SERVER, "No socket for connId=" + connId + ", dropping " + payload.length + " bytes");
+                }
             }
+
+            dispatchKcpToTcp(session, connectionManager, socketProtector);
         });
     }
 
     /**
      * 发送 SOCKS5 响应
      */
-    private static void sendReply(ServerSession session, byte replyCode) {
+    private static void sendReply(ServerSession session, int connId, byte replyCode) {
         byte[] reply = Socks5Response.buildFailureResponse(replyCode);
-        session.sendData(reply);
+        session.sendData(wrapWithConnId(connId, reply));
     }
 
     /**
      * 发送成功响应
      */
-    private static void sendSuccessReply(ServerSession session, String host, int port) {
+    private static void sendSuccessReply(ServerSession session, int connId, String host, int port) {
         byte[] reply = Socks5Response.buildSuccessResponse();
-        session.sendData(reply);
+        session.sendData(wrapWithConnId(connId, reply));
+    }
+
+    /**
+     * 为数据包添加 connId 前缀
+     */
+    private static byte[] wrapWithConnId(int connId, byte[] data) {
+        byte[] wrapped = new byte[1 + data.length];
+        wrapped[0] = (byte) connId;
+        System.arraycopy(data, 0, wrapped, 1, data.length);
+        return wrapped;
+    }
+
+    /**
+     * 获取 Socket 的文件描述符（用于 VpnService.protect(int)）
+     */
+    private static int getSocketFd(Socket socket) {
+        try {
+            java.lang.reflect.Field implField = Socket.class.getDeclaredField("impl");
+            implField.setAccessible(true);
+            Object impl = implField.get(socket);
+            if (impl == null) return -1;
+
+            java.io.FileDescriptor fd = null;
+            Class<?> clazz = impl.getClass();
+            while (clazz != null && fd == null) {
+                try {
+                    java.lang.reflect.Field fdField = clazz.getDeclaredField("fd");
+                    fdField.setAccessible(true);
+                    fd = (java.io.FileDescriptor) fdField.get(impl);
+                } catch (NoSuchFieldException e) {
+                    clazz = clazz.getSuperclass();
+                }
+            }
+            if (fd == null) return -1;
+
+            java.lang.reflect.Method getIntMethod = java.io.FileDescriptor.class.getDeclaredMethod("getInt$");
+            getIntMethod.setAccessible(true);
+            return (int) getIntMethod.invoke(fd);
+        } catch (Exception e) {
+            Logger.debug(LogConfig.MODULE_SOCKS5, "getSocketFd failed: " + e.getMessage());
+            return -1;
+        }
     }
 
     /**

@@ -2,6 +2,7 @@ package com.example.kcpvpn.server;
 
 import com.example.kcpvpn.core.crypto.Crypto;
 import com.example.kcpvpn.core.crypto.CryptoConfig;
+import com.example.kcpvpn.core.session.SocketProtector;
 import com.example.kcpvpn.log.LogConfig;
 import com.example.kcpvpn.log.Logger;
 
@@ -19,6 +20,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * 与 C++ KCPServer 一致
  */
 public class LocalKcpServer {
+
+    private static volatile SocketProtector socketProtector;
+
+    public static void setSocketProtector(SocketProtector protector) {
+        socketProtector = protector;
+    }
 
     private final String host;
     private final int port;
@@ -147,7 +154,8 @@ public class LocalKcpServer {
             }
         }
 
-        // 处理 SOCKS5 请求（如果握手未完成）
+        // 只在 SOCKS5 握手完成前处理 SOCKS5 请求
+        // 握手完成后由转发线程负责读取 KCP 数据并转发到 TCP
         if (!session.isHandshakeDone() && !session.isSocks5ReadPending()) {
             handleSocks5(session);
         }
@@ -192,9 +200,13 @@ public class LocalKcpServer {
     }
 
     /**
-     * 处理 SOCKS5
+     * 处理 SOCKS5 — 循环处理所有待处理的 SOCKS5 请求
+     * 每包前 1 byte 为 connId
      */
     private void handleSocks5(ServerSession session) {
+        if (session.isSocks5ReadPending()) {
+            return;  // 已在处理中，不重入
+        }
         session.setSocks5ReadPending(true);
 
         byte[] buffer = new byte[ServerConfig.FWD_BUF_SIZE];
@@ -202,11 +214,27 @@ public class LocalKcpServer {
             session.setSocks5ReadPending(false);
 
             if (data == null || data.length == 0) {
-                Logger.warning(LogConfig.MODULE_KCP_SERVER, "SOCKS5 read error");
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "SOCKS5 read empty or null");
+                return;
+            }
+            if (data.length < 1) {
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "SOCKS5 read too short for connId");
+                if (!session.isHandshakeDone() && !session.isSocks5ReadPending()) {
+                    handleSocks5(session);
+                }
                 return;
             }
 
-            Socks5Handler.handleRequest(session, data, connectionManager);
+            int connId = data[0] & 0xFF;
+            byte[] payload = new byte[data.length - 1];
+            System.arraycopy(data, 1, payload, 0, payload.length);
+
+            Socks5Handler.handleRequest(session, connId, payload, connectionManager, socketProtector);
+
+            // 如果 SOCKS5 握手已完成（转发线程已接管读取），不再递归
+            if (!session.isHandshakeDone() && !session.isSocks5ReadPending()) {
+                handleSocks5(session);
+            }
         });
     }
 
@@ -243,7 +271,7 @@ public class LocalKcpServer {
                         if (!session.isAlive()) {
                             Logger.info(LogConfig.MODULE_KCP_SERVER, "Cleaning up dead session: " + entry.getKey());
                             session.stop();
-                            connectionManager.closeConnection(entry.getKey());
+                            connectionManager.closeAllForSession(entry.getKey());
                             sessions.remove(entry.getKey());
                         }
                     }

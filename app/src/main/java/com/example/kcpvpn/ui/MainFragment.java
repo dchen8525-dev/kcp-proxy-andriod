@@ -120,6 +120,7 @@ public class MainFragment extends Fragment {
         setupListeners();
         setupObservers();
 
+
         // 恢复模式选择（先移除监听器避免触发事件，恢复后再添加）
         modeToggleGroup.removeOnButtonCheckedListener(modeChangeListener);
         MainViewModel.Mode savedMode = viewModel.getMode();
