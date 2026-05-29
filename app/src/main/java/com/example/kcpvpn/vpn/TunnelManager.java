@@ -152,7 +152,7 @@ public class TunnelManager {
             Logger.warning(LogConfig.MODULE_VPN, "Connection lost, triggering reconnect");
             reconnect();
         } else {
-            s.sendFrame(new KcpFrame(KcpFrame.TYPE_PING, 0, null));
+            s.sendPing();
         }
     }
 
@@ -163,6 +163,7 @@ public class TunnelManager {
 
         updateState(VpnConnectionState.RECONNECTING);
         closeSession();
+        running = false;
 
         int attempts = reconnectAttempts.incrementAndGet();
         int delay = reconnectDelayMs.get();
@@ -174,6 +175,7 @@ public class TunnelManager {
             try {
                 Thread.sleep(delay);
 
+                connecting.set(false);
                 if (connect()) {
                     Logger.info(LogConfig.MODULE_RECONNECT, "Reconnect successful");
                 } else {

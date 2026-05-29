@@ -8,7 +8,9 @@ import com.example.kcpvpn.log.Logger;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -166,9 +168,7 @@ public class PacketRouter {
                 if (conn.state == TcpState.SYN_RECEIVED) {
                     conn.state = TcpState.ESTABLISHED;
                 }
-                if (conn.unackedServerData > 0 && seqAfterOrEqual(clientAck, conn.serverNextSeq)) {
-                    conn.unackedServerData = 0;
-                }
+                conn.removeAckedServerSegments(clientAck);
                 conn.touch();
             }
         }
@@ -262,19 +262,18 @@ public class PacketRouter {
         if (payloadLen <= 0 || udpOffset + 8 + payloadLen > totalLen) {
             return;
         }
-        if (dstPort != 53) {
-            Logger.debug(LogConfig.MODULE_VPN, "UDP non-DNS dropped: dst="
-                    + addressToString(dstAddr) + ":" + dstPort);
-            return;
-        }
-
-        byte[] dnsPayload = new byte[payloadLen];
-        System.arraycopy(packet, udpOffset + 8, dnsPayload, 0, payloadLen);
+        byte[] udpPayload = new byte[payloadLen];
+        System.arraycopy(packet, udpOffset + 8, udpPayload, 0, payloadLen);
         sendFrameCallback.onSendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0,
-                buildUdpFramePayload(srcAddr, srcPort, dstAddr, dstPort, dnsPayload)));
-        Logger.info(LogConfig.MODULE_VPN, "UDP DNS request: src=" + addressToString(srcAddr) + ":" + srcPort
+                buildUdpFramePayload(srcAddr, srcPort, dstAddr, dstPort, udpPayload)));
+        String message = "UDP request: src=" + addressToString(srcAddr) + ":" + srcPort
                 + ", dst=" + addressToString(dstAddr) + ":" + dstPort
-                + ", payloadLength=" + payloadLen);
+                + ", payloadLength=" + payloadLen;
+        if (dstPort == 53) {
+            Logger.info(LogConfig.MODULE_VPN, message);
+        } else {
+            Logger.debug(LogConfig.MODULE_VPN, message);
+        }
     }
 
     public void handleInboundFrame(KcpFrame frame, WritePacketCallback writePacketCallback) {
@@ -287,10 +286,15 @@ public class PacketRouter {
                 UdpDatagram datagram = parseUdpFramePayload(frame.getPayload());
                 writePacketCallback.onWritePacket(buildUdpPacket(datagram.payload, datagram.dstAddr,
                         datagram.dstPort, datagram.srcAddr, datagram.srcPort));
-                Logger.info(LogConfig.MODULE_VPN, "UDP DNS response: src="
+                String message = "UDP response: src="
                         + addressToString(datagram.dstAddr) + ":" + datagram.dstPort
                         + ", dst=" + addressToString(datagram.srcAddr) + ":" + datagram.srcPort
-                        + ", payloadLength=" + datagram.payload.length);
+                        + ", payloadLength=" + datagram.payload.length;
+                if (datagram.dstPort == 53) {
+                    Logger.info(LogConfig.MODULE_VPN, message);
+                } else {
+                    Logger.debug(LogConfig.MODULE_VPN, message);
+                }
             } catch (Exception e) {
                 Logger.error(LogConfig.MODULE_VPN, "Build UDP response error: " + e.getMessage());
             }
@@ -312,8 +316,8 @@ public class PacketRouter {
                 synchronized (conn) {
                     ipPacket = buildTcpPacket(conn, frame.getPayload(), (byte) 0x18,
                             conn.serverNextSeq, conn.clientNextSeq);
+                    conn.addUnackedServerSegment(conn.serverNextSeq, frame.getPayloadLength());
                     conn.serverNextSeq += frame.getPayloadLength();
-                    conn.unackedServerData += frame.getPayloadLength();
                     conn.touch();
                 }
                 writePacketCallback.onWritePacket(ipPacket);
@@ -567,7 +571,7 @@ public class PacketRouter {
         private int clientNextSeq;
         private int serverNextSeq;
         private int lastAckFromClient;
-        private int unackedServerData;
+        private final Deque<UnackedSegment> unackedServerData;
         private long lastActivityTime;
         private TcpState state;
         private boolean synAckSent;
@@ -588,7 +592,7 @@ public class PacketRouter {
             this.clientNextSeq = 0;
             this.serverNextSeq = initialServerSeq;
             this.lastAckFromClient = 0;
-            this.unackedServerData = 0;
+            this.unackedServerData = new ArrayDeque<>();
             this.lastActivityTime = System.currentTimeMillis();
             this.state = TcpState.SYN_RECEIVED;
             this.synAckSent = false;
@@ -599,8 +603,39 @@ public class PacketRouter {
             lastActivityTime = System.currentTimeMillis();
         }
 
+        void addUnackedServerSegment(int seq, int length) {
+            if (length > 0) {
+                unackedServerData.addLast(new UnackedSegment(seq, length));
+            }
+        }
+
+        void removeAckedServerSegments(int ack) {
+            while (!unackedServerData.isEmpty()) {
+                UnackedSegment segment = unackedServerData.peekFirst();
+                if (seqAfterOrEqual(ack, segment.endSeq())) {
+                    unackedServerData.removeFirst();
+                } else {
+                    break;
+                }
+            }
+        }
+
         void close() {
             closed = true;
+        }
+    }
+
+    private static class UnackedSegment {
+        private final int seq;
+        private final int length;
+
+        UnackedSegment(int seq, int length) {
+            this.seq = seq;
+            this.length = length;
+        }
+
+        int endSeq() {
+            return seq + length;
         }
     }
 }

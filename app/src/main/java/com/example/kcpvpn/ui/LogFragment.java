@@ -47,7 +47,7 @@ public class LogFragment extends Fragment {
     private Consumer<LogEntry> logListener;
     private final List<LogEntry> pendingUiLogs = Collections.synchronizedList(new ArrayList<>());
     private final android.os.Handler uiLogHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private boolean uiFlushScheduled;
+    private volatile boolean uiFlushScheduled;
 
     private static final String STATE_LOG_LEVEL = "log_level";
 

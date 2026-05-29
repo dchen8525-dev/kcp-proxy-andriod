@@ -139,7 +139,7 @@ public class ServerSession {
             kcp.flush();
         }
 
-        Logger.debug(LogConfig.MODULE_KCP_SERVER, "Sent frame: connectionId="
+        Logger.debug(LogConfig.MODULE_KCP_SERVER, "server frame sent: connectionId="
                 + frame.getConnectionId() + ", frameType="
                 + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
                 + frame.getPayloadLength());
@@ -171,7 +171,7 @@ public class ServerSession {
 
             List<KcpFrame> frames = frameCodec.decode(data);
             for (KcpFrame frame : frames) {
-                Logger.debug(LogConfig.MODULE_KCP_SERVER, "Recv frame: connectionId="
+                Logger.debug(LogConfig.MODULE_KCP_SERVER, "server frame received: connectionId="
                         + frame.getConnectionId() + ", frameType="
                         + KcpFrame.frameTypeName(frame.getFrameType()) + ", payloadLength="
                         + frame.getPayloadLength());
@@ -206,6 +206,10 @@ public class ServerSession {
 
     public void setFrameHandler(Consumer<KcpFrame> frameHandler) {
         this.frameHandler = frameHandler;
+    }
+
+    public void setOnFrameReceived(Consumer<KcpFrame> frameHandler) {
+        setFrameHandler(frameHandler);
     }
 
     public boolean isAlive() {

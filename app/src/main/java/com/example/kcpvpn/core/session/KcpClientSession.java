@@ -34,6 +34,8 @@ public class KcpClientSession {
     private volatile boolean running;
     private volatile boolean connected;
     private final Object handshakeLock = new Object();
+    private final AtomicLong lastPingTime = new AtomicLong(0);
+    private final AtomicLong lastPongTime = new AtomicLong(System.currentTimeMillis());
 
     private final AtomicLong lastActivityTime;
 
@@ -239,6 +241,7 @@ public class KcpClientSession {
         }
         if (frame.getFrameType() == KcpFrame.TYPE_PONG) {
             touchActivity();
+            lastPongTime.set(System.currentTimeMillis());
             Logger.debug(LogConfig.MODULE_KCP_CLIENT, "PONG received");
             return true;
         }
@@ -298,7 +301,15 @@ public class KcpClientSession {
             return false;
         }
         long age = System.currentTimeMillis() - lastActivityTime.get();
-        return age < SessionConfig.KCP_TIMEOUT_MS;
+        long pingAt = lastPingTime.get();
+        long pongAt = lastPongTime.get();
+        return age < SessionConfig.KCP_TIMEOUT_MS && (pingAt == 0 || pongAt >= pingAt
+                || System.currentTimeMillis() - pingAt < 10_000);
+    }
+
+    public void sendPing() {
+        lastPingTime.set(System.currentTimeMillis());
+        sendFrame(new KcpFrame(KcpFrame.TYPE_PING, 0, null));
     }
 
     public int waitSend() {

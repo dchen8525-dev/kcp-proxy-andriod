@@ -482,6 +482,11 @@ public class Kcp {
         // 添加到 ACK 列表（需要发回给对端）
         ackList.add(sn, ts);
 
+        byte[] payload = new byte[segLen];
+        if (segLen > 0) {
+            buf.get(payload, 0, segLen);
+        }
+
         // 检查序列号是否在接收窗口内
         if (timeDiff(sn, rcv_nxt + rcv_wnd) >= 0 || timeDiff(sn, rcv_nxt) < 0) {
             // 超出窗口，但仍然发 ACK
@@ -496,9 +501,7 @@ public class Kcp {
         seg.ts = ts;
         seg.sn = sn;
         seg.len = segLen;
-        if (segLen > 0) {
-            buf.get(seg.data, 0, segLen);
-        }
+        seg.data = payload;
 
         // 放入接收缓冲区
         insertRcvBuf(seg);

@@ -18,6 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 本地 KCP 服务端 - 用于本地自测模式。
@@ -38,6 +39,7 @@ public class LocalKcpServer {
     private volatile boolean running;
 
     private final Map<String, ServerSession> sessions;
+    private final Map<String, UdpRelay> udpRelays;
     private final ServerConnectionManager connectionManager;
     private final ThreadPoolExecutor dnsExecutor;
 
@@ -50,6 +52,7 @@ public class LocalKcpServer {
         this.key = key;
 
         this.sessions = new ConcurrentHashMap<>();
+        this.udpRelays = new ConcurrentHashMap<>();
         this.connectionManager = new ServerConnectionManager();
         this.dnsExecutor = new ThreadPoolExecutor(
                 2,
@@ -156,6 +159,8 @@ public class LocalKcpServer {
 
         try {
             Crypto crypto = new Crypto(key, CryptoConfig.NONCE_DIR_SERVER, "");
+            Logger.debug(LogConfig.MODULE_KCP_SERVER, "Crypto created for new server session: "
+                    + clientAddr);
             byte[] decrypted = crypto.decrypt(encryptedPacket);
 
             ServerSession session = new ServerSession(clientAddr, crypto);
@@ -198,56 +203,65 @@ public class LocalKcpServer {
         try {
             dnsExecutor.execute(() -> relayDns(session, frame));
         } catch (RuntimeException e) {
-            Logger.error(LogConfig.MODULE_KCP_SERVER, "DNS relay executor overloaded: payloadLength="
+            Logger.error(LogConfig.MODULE_KCP_SERVER, "UDP relay executor overloaded: payloadLength="
                     + frame.getPayloadLength());
         }
     }
 
     private void relayDns(ServerSession session, KcpFrame frame) {
-        DatagramSocket socket = null;
         try {
             com.example.kcpvpn.vpn.PacketRouter.UdpDatagram datagram =
                     com.example.kcpvpn.vpn.PacketRouter.parseUdpFramePayload(frame.getPayload());
-            if (datagram.dstPort != 53) {
-                Logger.debug(LogConfig.MODULE_KCP_SERVER, "Ignoring non-DNS UDP datagram, dstPort="
-                        + datagram.dstPort);
-                return;
+            InetAddress remoteServer = chooseUdpServer(datagram);
+            String key = udpRelayKey(session.getSessionId(), datagram, remoteServer);
+            UdpRelay relay = udpRelays.get(key);
+            if (relay == null) {
+                UdpRelay created = new UdpRelay(key, session, datagram, remoteServer);
+                UdpRelay existing = udpRelays.putIfAbsent(key, created);
+                relay = existing == null ? created : existing;
+                if (existing == null) {
+                    relay.start();
+                }
             }
-
-            socket = new DatagramSocket();
-            socket.setSoTimeout(3000);
-            InetAddress dnsServer = chooseDnsServer(datagram.dstAddr);
-            DatagramPacket request = new DatagramPacket(datagram.payload, datagram.payload.length,
-                    dnsServer, 53);
-            socket.send(request);
-
-            byte[] buf = new byte[1500];
-            DatagramPacket response = new DatagramPacket(buf, buf.length);
-            socket.receive(response);
-
-            byte[] dnsPayload = new byte[response.getLength()];
-            System.arraycopy(response.getData(), response.getOffset(), dnsPayload, 0, response.getLength());
-            byte[] responsePayload = com.example.kcpvpn.vpn.PacketRouter.buildUdpFramePayload(
-                    datagram.srcAddr, datagram.srcPort, datagram.dstAddr, datagram.dstPort, dnsPayload);
-            session.sendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0, responsePayload));
-            Logger.info(LogConfig.MODULE_KCP_SERVER, "UDP DNS relayed: server="
-                    + dnsServer.getHostAddress() + ", payloadLength=" + dnsPayload.length);
+            relay.send(datagram.payload);
+            logUdpRelay(datagram.dstPort, "UDP relayed: server="
+                    + remoteServer.getHostAddress() + ":" + datagram.dstPort
+                    + ", payloadLength=" + datagram.payload.length);
         } catch (Exception e) {
-            Logger.warning(LogConfig.MODULE_KCP_SERVER, "DNS relay failed: " + e.getMessage());
-        } finally {
-            if (socket != null) {
-                socket.close();
-            }
+            Logger.warning(LogConfig.MODULE_KCP_SERVER, "UDP relay failed: " + e.getMessage());
         }
     }
 
-    private InetAddress chooseDnsServer(byte[] requestedAddr) throws IOException {
+    private InetAddress chooseUdpServer(com.example.kcpvpn.vpn.PacketRouter.UdpDatagram datagram)
+            throws IOException {
+        byte[] requestedAddr = datagram.dstAddr;
         String requested = (requestedAddr[0] & 0xFF) + "." + (requestedAddr[1] & 0xFF) + "."
                 + (requestedAddr[2] & 0xFF) + "." + (requestedAddr[3] & 0xFF);
-        if (!requested.startsWith("10.0.2.") && !"0.0.0.0".equals(requested)) {
+        if (datagram.dstPort != 53
+                || (!requested.startsWith("10.0.2.") && !"0.0.0.0".equals(requested))) {
             return InetAddress.getByName(requested);
         }
         return InetAddress.getByName("1.1.1.1");
+    }
+
+    private static String udpRelayKey(String sessionId,
+                                      com.example.kcpvpn.vpn.PacketRouter.UdpDatagram datagram,
+                                      InetAddress remoteAddr) {
+        return sessionId + "|" + addrToString(datagram.srcAddr) + ":" + datagram.srcPort
+                + "->" + remoteAddr.getHostAddress() + ":" + datagram.dstPort;
+    }
+
+    private static String addrToString(byte[] addr) {
+        return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
+                + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+    }
+
+    private static void logUdpRelay(int remotePort, String message) {
+        if (remotePort == 53) {
+            Logger.info(LogConfig.MODULE_KCP_SERVER, message);
+        } else {
+            Logger.debug(LogConfig.MODULE_KCP_SERVER, message);
+        }
     }
 
     private void sendToClient(InetSocketAddress clientAddr, byte[] data) {
@@ -270,6 +284,7 @@ public class LocalKcpServer {
                 try {
                     Thread.sleep(ServerConfig.CLEANUP_INTERVAL_MS);
 
+                    long now = System.currentTimeMillis();
                     for (Map.Entry<String, ServerSession> entry : sessions.entrySet()) {
                         ServerSession session = entry.getValue();
                         if (!session.isAlive()) {
@@ -277,6 +292,13 @@ public class LocalKcpServer {
                             session.stop();
                             connectionManager.closeSessionConnections(entry.getKey());
                             sessions.remove(entry.getKey());
+                        }
+                    }
+                    for (Map.Entry<String, UdpRelay> entry : udpRelays.entrySet()) {
+                        UdpRelay relay = entry.getValue();
+                        if (relay.isIdle(now, ServerConfig.CLEANUP_INTERVAL_MS * 2L)) {
+                            relay.close();
+                            udpRelays.remove(entry.getKey());
                         }
                     }
                 } catch (InterruptedException e) {
@@ -308,6 +330,10 @@ public class LocalKcpServer {
             session.stop();
         }
         sessions.clear();
+        for (UdpRelay relay : udpRelays.values()) {
+            relay.close();
+        }
+        udpRelays.clear();
 
         connectionManager.closeAll();
         dnsExecutor.shutdownNow();
@@ -330,5 +356,92 @@ public class LocalKcpServer {
 
     public int getSessionCount() {
         return sessions.size();
+    }
+
+    private class UdpRelay {
+        private static final int MAX_UDP_PACKET_SIZE = 65535;
+        private final String key;
+        private final ServerSession session;
+        private final byte[] clientAddr;
+        private final int clientPort;
+        private final byte[] remoteAddrBytes;
+        private final int remotePort;
+        private final InetAddress remoteAddr;
+        private final DatagramSocket socket;
+        private final AtomicBoolean closed;
+        private volatile long lastActivityTime;
+
+        UdpRelay(String key, ServerSession session,
+                 com.example.kcpvpn.vpn.PacketRouter.UdpDatagram datagram,
+                 InetAddress remoteAddr) throws IOException {
+            this.key = key;
+            this.session = session;
+            this.clientAddr = datagram.srcAddr;
+            this.clientPort = datagram.srcPort;
+            this.remoteAddrBytes = datagram.dstAddr;
+            this.remotePort = datagram.dstPort;
+            this.remoteAddr = remoteAddr;
+            this.socket = new DatagramSocket();
+            this.socket.setSoTimeout(1000);
+            SocketProtector protector = socketProtector;
+            if (protector != null) {
+                protector.protect(socket);
+            }
+            this.closed = new AtomicBoolean(false);
+            this.lastActivityTime = System.currentTimeMillis();
+        }
+
+        void start() {
+            Thread thread = new Thread(this::readLoop, "UDP-Relay-" + remotePort);
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        void send(byte[] payload) throws IOException {
+            DatagramPacket request = new DatagramPacket(payload, payload.length, remoteAddr, remotePort);
+            socket.send(request);
+            lastActivityTime = System.currentTimeMillis();
+        }
+
+        private void readLoop() {
+            byte[] buf = new byte[MAX_UDP_PACKET_SIZE];
+            try {
+                while (running && session.isAlive() && !closed.get()) {
+                    DatagramPacket response = new DatagramPacket(buf, buf.length);
+                    try {
+                        socket.receive(response);
+                    } catch (SocketTimeoutException e) {
+                        continue;
+                    }
+
+                    byte[] udpPayload = new byte[response.getLength()];
+                    System.arraycopy(response.getData(), response.getOffset(), udpPayload, 0, response.getLength());
+                    lastActivityTime = System.currentTimeMillis();
+                    byte[] responsePayload = com.example.kcpvpn.vpn.PacketRouter.buildUdpFramePayload(
+                            clientAddr, clientPort, remoteAddrBytes, remotePort, udpPayload);
+                    session.sendFrame(new KcpFrame(KcpFrame.TYPE_UDP_DATAGRAM, 0, responsePayload));
+                    logUdpRelay(remotePort, "UDP response relayed: server="
+                            + remoteAddr.getHostAddress() + ":" + remotePort
+                            + ", payloadLength=" + udpPayload.length);
+                }
+            } catch (Exception e) {
+                if (running && !closed.get()) {
+                    Logger.warning(LogConfig.MODULE_KCP_SERVER, "UDP relay read failed: " + e.getMessage());
+                }
+            } finally {
+                close();
+                udpRelays.remove(key);
+            }
+        }
+
+        void close() {
+            if (closed.compareAndSet(false, true)) {
+                socket.close();
+            }
+        }
+
+        boolean isIdle(long now, long idleTimeoutMs) {
+            return now - lastActivityTime > idleTimeoutMs;
+        }
     }
 }
