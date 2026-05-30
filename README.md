@@ -1,17 +1,19 @@
 # KCP VPN Android
 
-Android 11+ (API 30) 全局 KCP 隧道 VPN 应用。基于原生 VpnService 实现整机流量代理，纯 Java 实现，与 C++ [kcp-proxy-cpp](https://github.com/skywind3000/kcp) 服务端完全兼容。
+Android 11+ (API 30) 全局 KCP 隧道 VPN 应用。基于原生 VpnService 实现整机流量代理。
+远程模式对接 C++ [kcp-proxy-cpp](https://github.com/dchen8525-dev/kcp-proxy-cpp) 服务端。
 
 ## 功能特性
 
 - **双模式运行**
-  - 外网模式：连接远程 KCP 服务端（用户配置 IP、端口、密钥）
-  - 本地自测模式：内置 KCP 服务端（`127.0.0.1:8443`），本机闭环测试
+  - 外网模式：通过 CPP_REMOTE 连接远程 kcp-proxy-cpp 服务端（用户配置 IP、端口、密钥）
+  - 本地自测模式：使用内部/本地实现（`127.0.0.1:8443`），本机闭环测试
 
 - **协议兼容**
-  - KCP 参数与 C++ 版本完全一致（MTU=1400, SNDWND=256, RCVWND=512）
+  - CPP_REMOTE 使用 SOCKS5-over-KCP raw stream，首个 KCP payload 是 SOCKS5 CONNECT，后续 payload 是 TCP 字节流
+  - KCP 参数与 C++ 版本一致（MTU=1400, SNDWND=256, RCVWND=512）
   - HKDF-SHA256 密钥派生 + AES-128-GCM 加密 + 64-bit 重放防护
-  - SOCKS5 代理协议
+  - Android 在本地解析 DNS；C++ 服务端仅支持 SOCKS5 CONNECT TCP，不支持 UDP ASSOCIATE、QUIC 或 HTTP/3
 
 - **完整日志系统**
   - 分级日志（Debug/Info/Warning/Error）
@@ -51,7 +53,7 @@ export ANDROID_HOME=/path/to/Android/Sdk
 
 ### 外网模式
 
-1. 启动远程 KCP 服务端（kcp-proxy-cpp）
+1. 启动远程 KCP 服务端（[kcp-proxy-cpp](https://github.com/dchen8525-dev/kcp-proxy-cpp)）
 2. 在 APP 中填写服务器 IP、端口、密钥
 3. 点击「连接」→ 授权 VPN 权限
 4. 查看日志确认连接成功
@@ -149,5 +151,5 @@ Nonce 格式:
 
 ## 参考项目
 
-- [kcp-proxy-cpp](../../kcp-proxy-cpp) — C++ 版本服务端（协议兼容目标）
+- [kcp-proxy-cpp](https://github.com/dchen8525-dev/kcp-proxy-cpp) — C++ 版本服务端（CPP_REMOTE 协议兼容目标）
 - [skywind3000/kcp](https://github.com/skywind3000/kcp) — KCP 协议原版（C 语言）

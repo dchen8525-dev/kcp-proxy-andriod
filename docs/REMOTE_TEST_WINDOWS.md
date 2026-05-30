@@ -71,4 +71,5 @@ SOCKS5_RESPONSE_FAILED   Server response was malformed or fragmented beyond vali
 SOCKS5_CONNECT_FAILED    Server returned a non-zero SOCKS5 REP.
 ```
 
-Android INFO logs are intentionally lifecycle-only. Packet events such as TUN reads, VPN writes, UDP sends, KCP payload movement, and SOCKS5 hex dumps are DEBUG.
+Android INFO logs are intentionally lifecycle-only. Packet events such as TUN reads, VPN writes,
+UDP sends, KCP payload movement, and SOCKS5 hex dumps are DEBUG.

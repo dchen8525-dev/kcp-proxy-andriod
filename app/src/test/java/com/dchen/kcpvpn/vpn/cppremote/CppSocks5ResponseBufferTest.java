@@ -96,4 +96,26 @@ public class CppSocks5ResponseBufferTest {
                         0x01, (byte) 0xBB
                 }));
     }
+
+    @Test
+    public void unsupportedAtypIsRejected() {
+        CppSocks5ResponseBuffer buffer = new CppSocks5ResponseBuffer();
+
+        assertEquals(CppSocks5ResponseBuffer.Status.INVALID,
+                buffer.append(new byte[] {
+                        0x05, 0x00, 0x00, 0x02
+                }));
+    }
+
+    @Test
+    public void truncatedIpv4ResponseRemainsIncomplete() {
+        CppSocks5ResponseBuffer buffer = new CppSocks5ResponseBuffer();
+
+        assertEquals(CppSocks5ResponseBuffer.Status.INCOMPLETE,
+                buffer.append(new byte[] {
+                        0x05, 0x00, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        0x1F
+                }));
+    }
 }

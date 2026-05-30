@@ -14,9 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class CppRemoteTunnelManager {
     public enum RemoteState {
-        STARTED,
-        REMOTE_REACHABLE,
-        REMOTE_FAILED
+        CPP_REMOTE_STARTED,
+        CPP_REMOTE_REACHABLE,
+        CPP_REMOTE_FAILED
     }
 
     private final String serverHost;
@@ -57,7 +57,7 @@ public class CppRemoteTunnelManager {
                 + " crypto=CPP_COMPATIBLE_AES_128_GCM");
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE KCP conv=1 nodelay=1 interval=10"
                 + " resend=5 nc=1 sndWnd=256 rcvWnd=512 mtu=1400 timeout=60s");
-        notifyState(RemoteState.STARTED, "local VPN/tunnel manager started");
+        notifyState(RemoteState.CPP_REMOTE_STARTED, "local VPN/tunnel manager started");
         return true;
     }
 
@@ -76,14 +76,14 @@ public class CppRemoteTunnelManager {
             @Override
             public void onRemoteReachable() {
                 if (remoteReachable.compareAndSet(false, true)) {
-                    notifyState(RemoteState.REMOTE_REACHABLE, "valid SOCKS5 response received");
+                    notifyState(RemoteState.CPP_REMOTE_REACHABLE, "valid SOCKS5 response received");
                 }
             }
 
             @Override
             public void onRemoteFailed(String reason) {
                 if (!remoteReachable.get()) {
-                    notifyState(RemoteState.REMOTE_FAILED, reason);
+                    notifyState(RemoteState.CPP_REMOTE_FAILED, reason);
                 }
             }
         }, kcpScheduler);

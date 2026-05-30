@@ -348,9 +348,9 @@ public class KcpVpnService extends VpnService {
                 cppRemoteTunnelManager.setStateCallback((state, detail) -> {
                     Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE diagnostic state=" + state
                             + " detail=" + detail);
-                    if (state == CppRemoteTunnelManager.RemoteState.REMOTE_REACHABLE) {
+                    if (state == CppRemoteTunnelManager.RemoteState.CPP_REMOTE_REACHABLE) {
                         connectionState = VpnConnectionState.CONNECTED;
-                    } else if (state == CppRemoteTunnelManager.RemoteState.REMOTE_FAILED) {
+                    } else if (state == CppRemoteTunnelManager.RemoteState.CPP_REMOTE_FAILED) {
                         connectionState = VpnConnectionState.DISCONNECTED;
                     } else {
                         connectionState = VpnConnectionState.CONNECTING;
@@ -407,7 +407,7 @@ public class KcpVpnService extends VpnService {
             connectionStartTime = System.currentTimeMillis();
 
             // 不重复设 CONNECTED，tunnelManager 的回调已经设过了
-            Logger.info(LogConfig.MODULE_VPN, "VPN started successfully");
+            Logger.info(LogConfig.MODULE_VPN, "LOCAL_VPN_STARTED VPN started successfully");
 
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "Start VPN error: " + e.getMessage());

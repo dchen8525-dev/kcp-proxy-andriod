@@ -25,6 +25,7 @@ public class CppRemoteKcpSession {
     private static final int UDP_RECV_BUF_SIZE = 4096;
     private static final int KCP_RECV_BUF_SIZE = 64 * 1024;
     private static final int PENDING_LIMIT_BYTES = 512 * 1024;
+    private static final int SOCKS5_RESPONSE_TIMEOUT_SEC = 10;
 
     private final long connectionId;
     private final InetSocketAddress serverAddr;
@@ -41,12 +42,14 @@ public class CppRemoteKcpSession {
     private final Queue<byte[]> pendingClientData = new ArrayDeque<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final CppSocks5ResponseBuffer socks5ResponseBuffer = new CppSocks5ResponseBuffer();
+    private final ByteBuffer udpRecvBuffer = ByteBuffer.allocate(UDP_RECV_BUF_SIZE);
 
     private DatagramSocket udpSocket;
     private DatagramChannel udpChannel;
     private Kcp kcp;
     private Crypto crypto;
     private ScheduledFuture<?> updateTask;
+    private ScheduledFuture<?> socks5ResponseTimeoutTask;
     private volatile boolean running;
     private volatile boolean socks5Done;
     private int pendingBytes;
@@ -98,6 +101,7 @@ public class CppRemoteKcpSession {
             Logger.debug(LogConfig.MODULE_VPN, "SOCKS5 request hex=" + toHex(request)
                     + " connectionId=" + connectionId);
             sendRaw(request);
+            startSocks5ResponseTimeout();
             return true;
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE session start failed connectionId="
@@ -145,11 +149,21 @@ public class CppRemoteKcpSession {
         }, 0, KcpConfig.KCP_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
+    private void startSocks5ResponseTimeout() {
+        socks5ResponseTimeoutTask = kcpScheduler.schedule(() -> {
+            if (running && !socks5Done) {
+                Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5 response timeout connectionId="
+                        + connectionId + " timeoutSec=" + SOCKS5_RESPONSE_TIMEOUT_SEC);
+                close("CPP_SERVER_NO_RESPONSE");
+            }
+        }, SOCKS5_RESPONSE_TIMEOUT_SEC, TimeUnit.SECONDS);
+    }
+
     private void pollUdpPackets() {
         if (!running || udpChannel == null) {
             return;
         }
-        ByteBuffer buf = ByteBuffer.allocate(UDP_RECV_BUF_SIZE);
+        ByteBuffer buf = udpRecvBuffer;
         try {
             int packets = 0;
             while (packets++ < 64) {
@@ -248,6 +262,7 @@ public class CppRemoteKcpSession {
             return;
         }
         socks5Done = true;
+        cancelSocks5ResponseTimeout();
         remoteStateCallback.onRemoteReachable();
         flushPendingClientData();
         byte[] extra = socks5ResponseBuffer.extraPayload();
@@ -329,6 +344,7 @@ public class CppRemoteKcpSession {
             updateTask.cancel(false);
             updateTask = null;
         }
+        cancelSocks5ResponseTimeout();
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE connection closed reason=" + reason
                 + " connectionId=" + connectionId);
         if (isRemoteFailure(reason)) {
@@ -342,6 +358,13 @@ public class CppRemoteKcpSession {
                 && !"manager_stop".equals(reason)
                 && !"tcp_rst".equals(reason)
                 && !"tcp_fin".equals(reason);
+    }
+
+    private void cancelSocks5ResponseTimeout() {
+        if (socks5ResponseTimeoutTask != null) {
+            socks5ResponseTimeoutTask.cancel(false);
+            socks5ResponseTimeoutTask = null;
+        }
     }
 
     private static String addrToString(byte[] addr) {
