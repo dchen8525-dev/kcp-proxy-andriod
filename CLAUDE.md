@@ -27,7 +27,7 @@ No unit tests exist yet (`app/src/test/` is absent). Instrumentation tests would
 
 ## Architecture
 
-### Package Structure (under `com.example.kcpvpn`)
+### Package Structure (under `com.dchen.kcpvpn`)
 
 ```
 core/     - Pure Java, no Android dependencies (KCP, Crypto, SOCKS5, Session)

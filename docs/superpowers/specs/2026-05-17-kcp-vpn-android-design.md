@@ -465,7 +465,7 @@ log/
 
 ```
 app/
-├── java/com.example.kcpvpn/
+├── java/com.dchen.kcpvpn/
 │   ├── core/              # 核心层（纯 Java）
 │   │   ├── kcp/           # KCP 协议
 │   │   ├── crypto/        # 加密（HKDF + AES-GCM）

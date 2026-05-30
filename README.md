@@ -41,6 +41,12 @@ export ANDROID_HOME=/path/to/Android/Sdk
 # APK 输出: app/build/outputs/apk/debug/app-debug.apk
 ```
 
+完整验证：
+
+```bash
+./gradlew clean assembleDebug test lintDebug
+```
+
 ## 使用说明
 
 ### 外网模式
@@ -62,7 +68,7 @@ export ANDROID_HOME=/path/to/Android/Sdk
 ## 项目结构
 
 ```
-app/src/main/java/com/example/kcpvpn/
+app/src/main/java/com/dchen/kcpvpn/
 ├── core/                  # 核心层（纯 Java，无 Android 依赖）
 │   ├── kcp/               # KCP 协议实现（Kcp.java ~1600行，从 C ikcp.c 移植）
 │   ├── crypto/            # 加密（HKDF + AES-GCM + Nonce + 重放保护）

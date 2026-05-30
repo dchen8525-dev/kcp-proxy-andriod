@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'com.example.kcpvpn'
+    namespace 'com.dchen.kcpvpn'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.example.kcpvpn"
+        applicationId "com.dchen.kcpvpn"
         minSdk 30  // Android 11
         targetSdk 34
         versionCode 1
@@ -17,8 +17,16 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+            buildConfigField "String", "DEFAULT_LOG_LEVEL", "\"DEBUG\""
+            buildConfigField "boolean", "PACKET_TRACE_ENABLED", "true"
+        }
         release {
             minifyEnabled false
+            buildConfigField "String", "DEFAULT_LOG_LEVEL", "\"INFO\""
+            buildConfigField "boolean", "PACKET_TRACE_ENABLED", "false"
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
@@ -30,6 +38,7 @@ android {
 
     buildFeatures {
         viewBinding true
+        buildConfig true
     }
 }
 
