@@ -262,7 +262,7 @@ public class KcpClientSession {
             byte[] encrypted = crypto.encrypt(data);
             DatagramPacket packet = new DatagramPacket(encrypted, encrypted.length, serverAddr);
             udpSocket.send(packet);
-            Logger.info(LogConfig.MODULE_KCP_CLIENT, "KCP encrypted UDP send len=" + encrypted.length
+            Logger.debug(LogConfig.MODULE_KCP_CLIENT, "KCP encrypted UDP send len=" + encrypted.length
                     + " plainLen=" + len + " dst=" + serverAddr);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_KCP_CLIENT, "Encrypt/send error: " + e.getMessage());

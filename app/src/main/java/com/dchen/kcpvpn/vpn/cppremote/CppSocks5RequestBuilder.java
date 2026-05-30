@@ -4,6 +4,9 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 public final class CppSocks5RequestBuilder {
+    public static final int SOCKS5_RESPONSE_INVALID = -1;
+    public static final int SOCKS5_RESPONSE_INCOMPLETE = -2;
+
     private CppSocks5RequestBuilder() {
     }
 
@@ -22,24 +25,30 @@ public final class CppSocks5RequestBuilder {
     }
 
     public static int socks5ResponseLength(byte[] data) {
-        if (data == null || data.length < 4 || data[0] != 0x05) {
-            return -1;
+        if (data == null || data.length == 0) {
+            return SOCKS5_RESPONSE_INCOMPLETE;
+        }
+        if (data[0] != 0x05) {
+            return SOCKS5_RESPONSE_INVALID;
+        }
+        if (data.length < 4) {
+            return SOCKS5_RESPONSE_INCOMPLETE;
         }
         int atyp = data[3] & 0xFF;
         if (atyp == 0x01) {
-            return data.length >= 10 ? 10 : -1;
+            return data.length >= 10 ? 10 : SOCKS5_RESPONSE_INCOMPLETE;
         }
         if (atyp == 0x04) {
-            return data.length >= 22 ? 22 : -1;
+            return data.length >= 22 ? 22 : SOCKS5_RESPONSE_INCOMPLETE;
         }
         if (atyp == 0x03) {
             if (data.length < 5) {
-                return -1;
+                return SOCKS5_RESPONSE_INCOMPLETE;
             }
             int domainLen = data[4] & 0xFF;
             int total = 5 + domainLen + 2;
-            return data.length >= total ? total : -1;
+            return data.length >= total ? total : SOCKS5_RESPONSE_INCOMPLETE;
         }
-        return -1;
+        return SOCKS5_RESPONSE_INVALID;
     }
 }

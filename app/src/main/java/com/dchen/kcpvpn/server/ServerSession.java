@@ -112,7 +112,7 @@ public class ServerSession {
         try {
             byte[] encrypted = crypto.encrypt(data);
             sendCallback.accept(encrypted);
-            Logger.info(LogConfig.MODULE_KCP_SERVER, "KCP encrypted UDP send len=" + encrypted.length
+            Logger.debug(LogConfig.MODULE_KCP_SERVER, "KCP encrypted UDP send len=" + encrypted.length
                     + " plainLen=" + len + " dst=" + clientAddr);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_KCP_SERVER, "Encrypt error: " + e.getMessage());

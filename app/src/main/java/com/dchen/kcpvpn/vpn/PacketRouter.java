@@ -106,7 +106,7 @@ public class PacketRouter {
             byte[] srcAddr = Arrays.copyOfRange(packet, 12, 16);
             byte[] dstAddr = Arrays.copyOfRange(packet, 16, 20);
             byte protocol = buf.get(9);
-            Logger.info(LogConfig.MODULE_VPN, "PacketRouter parse protocol=" + (protocol & 0xFF)
+            Logger.debug(LogConfig.MODULE_VPN, "PacketRouter parse protocol=" + (protocol & 0xFF)
                     + " src=" + addressToString(srcAddr)
                     + " dst=" + addressToString(dstAddr)
                     + " len=" + totalLen);
@@ -195,7 +195,7 @@ public class PacketRouter {
                 conn.touch();
             }
             if (!localMode && cppRemoteTunnelManager != null) {
-                Logger.info(LogConfig.MODULE_VPN, "Chrome ACK received connectionId=" + conn.connectionId
+                Logger.debug(LogConfig.MODULE_VPN, "Chrome ACK received connectionId=" + conn.connectionId
                         + " ack=" + (clientAck & 0xFFFFFFFFL));
             }
         }
@@ -444,7 +444,7 @@ public class PacketRouter {
                     byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
                             seq, conn.clientNextSeq);
                     writePacketCallback.onWritePacket(ipPacket);
-                    Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE TCP OUT to TUN len=" + ipPacket.length
+                    Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE TCP OUT to TUN len=" + ipPacket.length
                             + " connectionId=" + connectionId);
                     logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
                     conn.addUnackedServerSegment(seq, segmentLen);
@@ -512,7 +512,7 @@ public class PacketRouter {
         new Thread(() -> {
             try (DatagramSocket socket = new DatagramSocket()) {
                 boolean protectedOk = socketProtector != null && socketProtector.protect(socket);
-                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP IN query="
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP IN query="
                         + addressToString(dstAddr) + ":" + dstPort
                         + " src=" + addressToString(srcAddr) + ":" + srcPort);
                 Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP socket protected=" + protectedOk);
@@ -528,10 +528,10 @@ public class PacketRouter {
                 socket.receive(response);
                 byte[] dnsPayload = Arrays.copyOfRange(response.getData(), response.getOffset(),
                         response.getOffset() + response.getLength());
-                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS response received len=" + dnsPayload.length);
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE DNS response received len=" + dnsPayload.length);
                 byte[] udpPacket = buildUdpPacket(dnsPayload, dstAddr, dstPort, srcAddr, srcPort);
                 writePacketCallback.onWritePacket(udpPacket);
-                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP OUT written to TUN");
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP OUT written to TUN");
             } catch (Exception e) {
                 Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE DNS_FAILED error=" + e.getMessage());
             }
@@ -689,7 +689,7 @@ public class PacketRouter {
 
     private static void logTcpIn(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
                                  int flags, int seq, int ack, int len) {
-        Logger.info(LogConfig.MODULE_VPN, "TCP IN src=" + addressToString(srcAddr) + ":" + srcPort
+        Logger.debug(LogConfig.MODULE_VPN, "TCP IN src=" + addressToString(srcAddr) + ":" + srcPort
                 + " dst=" + addressToString(dstAddr) + ":" + dstPort
                 + " flags=0x" + Integer.toHexString(flags)
                 + " seq=" + (seq & 0xFFFFFFFFL)
@@ -698,7 +698,7 @@ public class PacketRouter {
     }
 
     private static void logTcpOut(TcpConnection conn, int flags, int seq, int ack, int len) {
-        Logger.info(LogConfig.MODULE_VPN, "TCP OUT src=" + conn.dstHost + ":" + conn.dstPort
+        Logger.debug(LogConfig.MODULE_VPN, "TCP OUT src=" + conn.dstHost + ":" + conn.dstPort
                 + " dst=" + conn.srcHost + ":" + conn.srcPort
                 + " flags=0x" + Integer.toHexString(flags)
                 + " seq=" + (seq & 0xFFFFFFFFL)
@@ -709,7 +709,7 @@ public class PacketRouter {
     private void logUdpTrace(String message, int srcPort, int dstPort) {
         if (srcPort == 53 || dstPort == 53
                 || udpTraceCounter.incrementAndGet() % UDP_TRACE_SAMPLE_RATE == 0) {
-            Logger.info(LogConfig.MODULE_VPN, message);
+            Logger.debug(LogConfig.MODULE_VPN, message);
         }
     }
 

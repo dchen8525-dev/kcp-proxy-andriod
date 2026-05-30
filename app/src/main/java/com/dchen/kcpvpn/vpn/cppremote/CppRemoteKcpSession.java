@@ -9,13 +9,16 @@ import com.dchen.kcpvpn.log.Logger;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
-import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
 import java.util.ArrayDeque;
 import java.util.Locale;
 import java.util.Queue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class CppRemoteKcpSession {
@@ -31,23 +34,28 @@ public class CppRemoteKcpSession {
     private final SocketProtector socketProtector;
     private final DataCallback dataCallback;
     private final CloseCallback closeCallback;
+    private final RemoteStateCallback remoteStateCallback;
+    private final ScheduledExecutorService kcpScheduler;
     private final Object kcpLock = new Object();
     private final Object pendingLock = new Object();
     private final Queue<byte[]> pendingClientData = new ArrayDeque<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final CppSocks5ResponseBuffer socks5ResponseBuffer = new CppSocks5ResponseBuffer();
 
     private DatagramSocket udpSocket;
+    private DatagramChannel udpChannel;
     private Kcp kcp;
     private Crypto crypto;
-    private Thread recvThread;
-    private Thread updateThread;
+    private ScheduledFuture<?> updateTask;
     private volatile boolean running;
     private volatile boolean socks5Done;
     private int pendingBytes;
 
     public CppRemoteKcpSession(long connectionId, String serverHost, int serverPort, String key,
                                byte[] dstAddr, int dstPort, SocketProtector socketProtector,
-                               DataCallback dataCallback, CloseCallback closeCallback) {
+                               DataCallback dataCallback, CloseCallback closeCallback,
+                               RemoteStateCallback remoteStateCallback,
+                               ScheduledExecutorService kcpScheduler) {
         this.connectionId = connectionId;
         this.serverAddr = new InetSocketAddress(serverHost, serverPort);
         this.key = key;
@@ -56,6 +64,8 @@ public class CppRemoteKcpSession {
         this.socketProtector = socketProtector;
         this.dataCallback = dataCallback;
         this.closeCallback = closeCallback;
+        this.remoteStateCallback = remoteStateCallback;
+        this.kcpScheduler = kcpScheduler;
     }
 
     public boolean start() {
@@ -68,24 +78,24 @@ public class CppRemoteKcpSession {
             kcp.setMtu(KcpConfig.KCP_MTU);
             kcp.setOutputCallback(this::handleKcpOutput);
 
-            udpSocket = new DatagramSocket();
-            udpSocket.setSoTimeout(1000);
+            udpChannel = DatagramChannel.open();
+            udpChannel.configureBlocking(false);
+            udpSocket = udpChannel.socket();
             boolean protectedOk = socketProtector != null && socketProtector.protect(udpSocket);
             Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE KCP UDP socket protected=" + protectedOk
                     + " connectionId=" + connectionId);
             if (!protectedOk) {
                 throw new IOException("KCP_SOCKET_PROTECT_FAILED");
             }
-            udpSocket.connect(serverAddr);
+            udpChannel.connect(serverAddr);
 
             running = true;
             startUpdateThread();
-            startRecvThread();
 
             byte[] request = CppSocks5RequestBuilder.buildIpv4Connect(dstAddr, dstPort);
             Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5 CONNECT connectionId=" + connectionId
                     + " dst=" + addrToString(dstAddr) + ":" + dstPort);
-            Logger.info(LogConfig.MODULE_VPN, "SOCKS5 request hex=" + toHex(request)
+            Logger.debug(LogConfig.MODULE_VPN, "SOCKS5 request hex=" + toHex(request)
                     + " connectionId=" + connectionId);
             sendRaw(request);
             return true;
@@ -113,59 +123,56 @@ public class CppRemoteKcpSession {
                 pendingClientData.add(copy);
                 pendingBytes += copy.length;
             }
-            Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE queued TCP payload before SOCKS5 connectionId="
+            Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE queued TCP payload before SOCKS5 connectionId="
                     + connectionId + " len=" + data.length);
             return;
         }
-        Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE TCP payload -> KCP raw len=" + data.length
+        Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE TCP payload -> KCP raw len=" + data.length
                 + " connectionId=" + connectionId);
         sendRaw(data);
     }
 
     private void startUpdateThread() {
-        updateThread = new Thread(() -> {
-            while (running) {
-                try {
-                    synchronized (kcpLock) {
-                        kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
-                        kcp.flush();
-                    }
-                    Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
-                } catch (InterruptedException e) {
-                    break;
-                }
+        updateTask = kcpScheduler.scheduleAtFixedRate(() -> {
+            if (!running) {
+                return;
             }
-        }, "CPP-KCP-Update-" + connectionId);
-        updateThread.setDaemon(true);
-        updateThread.start();
+            synchronized (kcpLock) {
+                kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+                kcp.flush();
+            }
+            pollUdpPackets();
+        }, 0, KcpConfig.KCP_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
-    private void startRecvThread() {
-        recvThread = new Thread(() -> {
-            byte[] buf = new byte[UDP_RECV_BUF_SIZE];
-            while (running) {
-                try {
-                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
-                    udpSocket.receive(packet);
-                    if (packet.getLength() <= 0) {
-                        continue;
-                    }
-                    byte[] encrypted = new byte[packet.getLength()];
-                    System.arraycopy(packet.getData(), packet.getOffset(), encrypted, 0, packet.getLength());
-                    onUdpPacket(encrypted);
-                } catch (SocketTimeoutException ignored) {
-                } catch (IOException e) {
-                    if (running) {
-                        Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE UDP receive failed connectionId="
-                                + connectionId + " error=" + e.getMessage());
-                        close("CPP_SERVER_NO_RESPONSE");
-                    }
-                    break;
+    private void pollUdpPackets() {
+        if (!running || udpChannel == null) {
+            return;
+        }
+        ByteBuffer buf = ByteBuffer.allocate(UDP_RECV_BUF_SIZE);
+        try {
+            int packets = 0;
+            while (packets++ < 64) {
+                buf.clear();
+                if (udpChannel.receive(buf) == null) {
+                    return;
                 }
+                int len = buf.position();
+                if (len <= 0) {
+                    continue;
+                }
+                byte[] encrypted = new byte[len];
+                buf.flip();
+                buf.get(encrypted);
+                onUdpPacket(encrypted);
             }
-        }, "CPP-KCP-Recv-" + connectionId);
-        recvThread.setDaemon(true);
-        recvThread.start();
+        } catch (IOException e) {
+            if (running) {
+                Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE UDP receive failed connectionId="
+                        + connectionId + " error=" + e.getMessage());
+                close("CPP_SERVER_NO_RESPONSE");
+            }
+        }
     }
 
     private void onUdpPacket(byte[] encrypted) {
@@ -213,7 +220,7 @@ public class CppRemoteKcpSession {
             if (!socks5Done) {
                 handleSocks5Response(data);
             } else {
-                Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE KCP raw -> TCP payload len=" + data.length
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE KCP raw -> TCP payload len=" + data.length
                         + " connectionId=" + connectionId);
                 dataCallback.onData(data);
             }
@@ -221,14 +228,19 @@ public class CppRemoteKcpSession {
     }
 
     private void handleSocks5Response(byte[] data) {
-        int responseLen = CppSocks5RequestBuilder.socks5ResponseLength(data);
-        if (responseLen < 0) {
+        CppSocks5ResponseBuffer.Status parseStatus = socks5ResponseBuffer.append(data);
+        if (parseStatus == CppSocks5ResponseBuffer.Status.INCOMPLETE) {
+            Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5 response incomplete connectionId="
+                    + connectionId + " chunkLen=" + data.length);
+            return;
+        }
+        if (parseStatus == CppSocks5ResponseBuffer.Status.INVALID) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5_RESPONSE_FAILED connectionId="
                     + connectionId + " len=" + data.length);
             close("SOCKS5_RESPONSE_FAILED");
             return;
         }
-        int status = data[1] & 0xFF;
+        int status = socks5ResponseBuffer.reply();
         Logger.info(LogConfig.MODULE_VPN, String.format(Locale.US,
                 "CPP_REMOTE SOCKS5 response rep=0x%02X connectionId=%d", status, connectionId));
         if (status != 0) {
@@ -236,10 +248,10 @@ public class CppRemoteKcpSession {
             return;
         }
         socks5Done = true;
+        remoteStateCallback.onRemoteReachable();
         flushPendingClientData();
-        if (data.length > responseLen) {
-            byte[] extra = new byte[data.length - responseLen];
-            System.arraycopy(data, responseLen, extra, 0, extra.length);
+        byte[] extra = socks5ResponseBuffer.extraPayload();
+        if (extra.length > 0) {
             dataCallback.onData(extra);
         }
     }
@@ -255,7 +267,7 @@ public class CppRemoteKcpSession {
         }
         byte[] data = out.toByteArray();
         if (data.length > 0) {
-            Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE flush queued TCP payload len=" + data.length
+            Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE flush queued TCP payload len=" + data.length
                     + " connectionId=" + connectionId);
             sendRaw(data);
         }
@@ -279,15 +291,15 @@ public class CppRemoteKcpSession {
     }
 
     private void handleKcpOutput(byte[] data, int len) {
-        if (!running || udpSocket == null) {
+        if (!running || udpChannel == null) {
             return;
         }
         try {
             byte[] plain = new byte[len];
             System.arraycopy(data, 0, plain, 0, len);
             byte[] encrypted = crypto.encrypt(plain);
-            udpSocket.send(new DatagramPacket(encrypted, encrypted.length, serverAddr));
-            Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE UDP send to "
+            udpChannel.write(ByteBuffer.wrap(encrypted));
+            Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE UDP send to "
                     + serverAddr.getHostString() + ":" + serverAddr.getPort()
                     + " len=" + encrypted.length + " connectionId=" + connectionId);
         } catch (Exception e) {
@@ -306,17 +318,30 @@ public class CppRemoteKcpSession {
             udpSocket.close();
             udpSocket = null;
         }
-        if (recvThread != null) {
-            recvThread.interrupt();
-            recvThread = null;
+        if (udpChannel != null) {
+            try {
+                udpChannel.close();
+            } catch (IOException ignored) {
+            }
+            udpChannel = null;
         }
-        if (updateThread != null) {
-            updateThread.interrupt();
-            updateThread = null;
+        if (updateTask != null) {
+            updateTask.cancel(false);
+            updateTask = null;
         }
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE connection closed reason=" + reason
                 + " connectionId=" + connectionId);
+        if (isRemoteFailure(reason)) {
+            remoteStateCallback.onRemoteFailed(reason);
+        }
         closeCallback.onClosed(reason);
+    }
+
+    private static boolean isRemoteFailure(String reason) {
+        return reason != null
+                && !"manager_stop".equals(reason)
+                && !"tcp_rst".equals(reason)
+                && !"tcp_fin".equals(reason);
     }
 
     private static String addrToString(byte[] addr) {
@@ -345,5 +370,10 @@ public class CppRemoteKcpSession {
 
     public interface CloseCallback {
         void onClosed(String reason);
+    }
+
+    public interface RemoteStateCallback {
+        void onRemoteReachable();
+        void onRemoteFailed(String reason);
     }
 }

@@ -345,6 +345,19 @@ public class KcpVpnService extends VpnService {
             } else {
                 cppRemoteTunnelManager = new CppRemoteTunnelManager(serverHost, serverPort, key);
                 cppRemoteTunnelManager.setSocketProtector(protector);
+                cppRemoteTunnelManager.setStateCallback((state, detail) -> {
+                    Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE diagnostic state=" + state
+                            + " detail=" + detail);
+                    if (state == CppRemoteTunnelManager.RemoteState.REMOTE_REACHABLE) {
+                        connectionState = VpnConnectionState.CONNECTED;
+                    } else if (state == CppRemoteTunnelManager.RemoteState.REMOTE_FAILED) {
+                        connectionState = VpnConnectionState.DISCONNECTED;
+                    } else {
+                        connectionState = VpnConnectionState.CONNECTING;
+                    }
+                    broadcastState();
+                    updateNotification();
+                });
             }
 
             // 创建数据包路由器
@@ -379,7 +392,7 @@ public class KcpVpnService extends VpnService {
                     stopSelf();
                     return;
                 }
-                connectionState = VpnConnectionState.CONNECTED;
+                connectionState = VpnConnectionState.CONNECTING;
                 broadcastState();
                 updateNotification();
                 Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE manager started successfully");
@@ -422,7 +435,7 @@ public class KcpVpnService extends VpnService {
                         buffer.flip();
                         byte[] packet = new byte[len];
                         buffer.get(packet);
-                        Logger.info(LogConfig.MODULE_VPN, "TUN IN len=" + len);
+                        Logger.debug(LogConfig.MODULE_VPN, "TUN IN len=" + len);
 
                         // 处理出站数据包
                         packetRouter.handleOutboundPacket(packet,
@@ -499,7 +512,7 @@ public class KcpVpnService extends VpnService {
                             writeToVpn(packet);
                             downloadBytes.addAndGet(packet.length);
 
-                            Logger.info(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
+                            Logger.debug(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
                         } catch (IOException e) {
                             Logger.error(LogConfig.MODULE_VPN, "VPN write error: " + e.getMessage());
                         }
@@ -510,7 +523,7 @@ public class KcpVpnService extends VpnService {
     private synchronized void writeToVpn(byte[] packet) throws IOException {
         ByteBuffer buffer = ByteBuffer.wrap(packet);
         vpnOutputChannel.write(buffer);
-        Logger.info(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
+        Logger.debug(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
     }
 
     /**
