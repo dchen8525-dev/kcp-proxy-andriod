@@ -12,7 +12,9 @@ Android 11+ (API 30) 全局 KCP 隧道 VPN 应用。基于原生 VpnService 实�
 - **协议兼容**
   - CPP_REMOTE 使用 SOCKS5-over-KCP raw stream，首个 KCP payload 是 SOCKS5 CONNECT，后续 payload 是 TCP 字节流
   - KCP 参数与 C++ 版本一致（MTU=1400, SNDWND=256, RCVWND=512）
-  - HKDF-SHA256 密钥派生 + AES-128-GCM 加密 + 64-bit 重放防护
+  - HKDF-SHA256 per-session 密钥派生 + AES-128-GCM 加密 + 2048-bit 重放防护（V2 线格式，与 C++ 端逐字节一致）
+  - V2 握手 `KCP_PROXY_HELLO_V2` / `KCP_PROXY_HELLO_ACK_V2`，支持 keepalive 与 FIN 半关闭（本地 FIN 后等待服务端排空在途数据）
+  - 出站背压：KCP 发送队列达到阈值时按序排队、由更新线程排空，排队上限 2MB，超限即关闭会话（不会无界吃内存）
   - Android 在本地解析 DNS；C++ 服务端仅支持 SOCKS5 CONNECT TCP，不支持 UDP ASSOCIATE、QUIC 或 HTTP/3
 
 - **完整日志系统**
@@ -119,6 +121,7 @@ app/src/main/java/com/dchen/kcpvpn/
 | KCP nodelay | enabled / fastresend=5 / nocwnd=1 | 快速重传，禁用拥塞控制 |
 | Default conv | 1 | 默认会话号 |
 | APP_SALT | `kcp-proxy-hkdf-salt-v1` | 应用固定盐值 |
+| SESSION_SALT | 16 字节 / 每会话随机 | 线上明文携带，参与密钥派生 |
 | HKDF info C2S | `kcp-proxy/c2s/v1` | 客户端→服务端密钥派生标签 |
 | HKDF info S2C | `kcp-proxy/s2c/v1` | 服务端→客户端密钥派生标签 |
 | NONCE_SIZE | 12 字节 | Nonce 长度 |
@@ -126,21 +129,28 @@ app/src/main/java/com/dchen/kcpvpn/
 | AES_KEY_SIZE | 16 字节 | AES-128 密钥 |
 | Nonce 方向 | CLIENT=0x01, SERVER=0x02 | 防止方向混淆 |
 | Nonce 格式 | counter(8B) + direction(1B) + padding(3B) | 大端序 |
-| REPLAY_WINDOW | 64 bit | 重放防护窗口 |
+| 计数器起点 | session_salt 前 6 字节（大端） | 避免跨会话 (key, nonce) 复用 |
+| REPLAY_WINDOW | 2048 bit | 重放防护窗口（校验通过后才提交） |
 | Max counter | 2^48 | IND-CPA 安全上限 |
+| 握手 | `KCP_PROXY_HELLO_V2` → `KCP_PROXY_HELLO_ACK_V2` | 协商半关闭能力 |
+| keepalive / FIN | `magic \|\| session_salt` | 空闲 30s；精确匹配后丢弃，不进隧道 |
 
 ## 加密流程
 
 ```
-密钥派生:
-  user_key + user_salt + APP_SALT → HKDF-SHA256 → AES-128 密钥（按方向独立派生）
+密钥派生（每个会话一次）:
+  HKDF-SHA256(ikm=user_key, salt=APP_SALT || session_salt, info=方向标签) → AES-128 密钥
 
-加密输出:
-  [nonce(12字节)] + [ciphertext] + [tag(16字节)]
+加密输出（V2 线格式）:
+  [session_salt(16字节)] + [nonce(12字节)] + [ciphertext] + [tag(16字节)]
 
 Nonce 格式:
   [counter(8字节, big-endian)] + [direction(1字节)] + [padding(3字节, 零)]
 ```
+
+服务端从首个报文学到 `session_salt` 后才派生密钥（首包旁路重放窗口），此后每个报文都必须携带
+同一 salt，防止跨会话注入。密钥与 PSK 材料在派生完成后立即擦除，因此服务端会话不可复用，
+重连必须新建会话。
 
 ## 技术栈
 

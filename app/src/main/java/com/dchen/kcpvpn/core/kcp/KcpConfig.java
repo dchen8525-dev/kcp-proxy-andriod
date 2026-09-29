@@ -1,5 +1,7 @@
 package com.dchen.kcpvpn.core.kcp;
 
+import com.dchen.kcpvpn.core.session.SessionConfig;
+
 /**
  * KCP 配置常量 - 与 C++ config.hpp 完全一致
  */
@@ -12,8 +14,18 @@ public class KcpConfig {
     public static final int KCP_TIMEOUT_SEC = 60;
     public static final int RECONNECT_DELAY_SEC = 2;
 
-    // 背压控制阈值
-    public static final int KCP_BACKPRESSURE_THRESHOLD = KCP_SNDWND * 2;
+    // ikcp 段头部开销（conv4+cmd1+frg1+wnd2+ts4+sn4+una4+len4）
+    public static final int KCP_SEGMENT_OVERHEAD = 24;
+
+    // 单条消息最多切成的段数（与 C++ KCP_MAX_SEGMENTS_PER_MSG 同式）
+    public static final int KCP_MAX_SEGMENTS_PER_MSG =
+            (SessionConfig.FWD_BUF_SIZE + (KCP_MTU - KCP_SEGMENT_OVERHEAD) - 1)
+                    / (KCP_MTU - KCP_SEGMENT_OVERHEAD);
+
+    // 背压控制阈值：必须明显小于 sndWnd 且为整条消息留足排队空间，
+    // 否则 ikcp_send 会失败而不是背压（与 C++ KCP_BACKPRESSURE_THRESHOLD 同式）
+    public static final int KCP_BACKPRESSURE_THRESHOLD =
+            KCP_SNDWND - KCP_MAX_SEGMENTS_PER_MSG - 8;
 
     // 默认会话号
     public static final int DEFAULT_CONV = 1;

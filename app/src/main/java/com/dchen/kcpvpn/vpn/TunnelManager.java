@@ -210,10 +210,8 @@ public class TunnelManager {
             session.close();
             session = null;
         }
-
-        if (crypto != null) {
-            crypto.reset();
-        }
+        // 每会话一个全新 Crypto（新 salt、新计数器起点），不复用重置旧实例
+        crypto = null;
     }
 
     private void updateState(VpnConnectionState state) {

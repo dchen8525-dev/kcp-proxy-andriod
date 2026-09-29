@@ -83,6 +83,12 @@ public class KcpClientSession {
         try {
             udpSocket = new DatagramSocket();
             udpSocket.setSoTimeout(1000);
+            try {
+                udpSocket.setReceiveBufferSize(SessionConfig.UDP_SO_RCVBUF_BYTES);
+                udpSocket.setSendBufferSize(SessionConfig.UDP_SO_SNDBUF_BYTES);
+            } catch (Exception e) {
+                Logger.warning(LogConfig.MODULE_KCP_CLIENT, "UDP buffer size request failed: " + e.getMessage());
+            }
 
             SocketProtector protector = socketProtector;
             if (protector != null) {

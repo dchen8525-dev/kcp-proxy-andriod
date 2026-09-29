@@ -68,10 +68,15 @@ public class CppRemoteTunnelManager {
             Logger.warning(LogConfig.MODULE_VPN, "CPP_REMOTE createConnection ignored, manager stopped");
             return;
         }
+        // slot 保存本连接当前会话：close 回调触发时据此判断是否仍 owns 映射。
+        // 半关闭（本地 FIN 已发、等待服务端排空）时 sendLocalFin 不真正 close，
+        // 不得提前摘除映射，否则后续入站数据与关闭回调会丢失。
+        final CppRemoteKcpSession[] slot = new CppRemoteKcpSession[1];
         CppRemoteKcpSession session = new CppRemoteKcpSession(connectionId, serverHost, serverPort,
                 key, dstAddr, dstPort, socketProtector, dataCallback, reason -> {
-            sessions.remove(connectionId);
-            closeCallback.onClosed(reason);
+            if (slot[0] != null && sessions.remove(connectionId, slot[0])) {
+                closeCallback.onClosed(reason);
+            }
         }, new CppRemoteKcpSession.RemoteStateCallback() {
             @Override
             public void onRemoteReachable() {
@@ -87,6 +92,7 @@ public class CppRemoteTunnelManager {
                 }
             }
         }, kcpScheduler);
+        slot[0] = session;
         CppRemoteKcpSession existing = sessions.putIfAbsent(connectionId, session);
         if (existing != null) {
             session.close("duplicate_connection");
@@ -94,7 +100,7 @@ public class CppRemoteTunnelManager {
         }
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE session created connectionId=" + connectionId);
         if (!session.start()) {
-            sessions.remove(connectionId);
+            sessions.remove(connectionId, session);
             closeCallback.onClosed("KCP_SESSION_FAILED");
         }
     }
@@ -112,6 +118,21 @@ public class CppRemoteTunnelManager {
         CppRemoteKcpSession session = sessions.remove(connectionId);
         if (session != null) {
             session.close(reason);
+        }
+    }
+
+    /**
+     * 本地 TCP FIN：V2 协商成功时发送 FIN 进入排空态（映射保留，直至真正关闭），
+     * 老服务端则退化为立即关闭。
+     */
+    public void halfCloseConnection(long connectionId) {
+        CppRemoteKcpSession session = sessions.get(connectionId);
+        if (session == null) {
+            return;
+        }
+        session.sendLocalFin();
+        if (session.isClosed()) {
+            sessions.remove(connectionId, session);
         }
     }
 

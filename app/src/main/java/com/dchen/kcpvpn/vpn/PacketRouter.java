@@ -21,7 +21,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public class PacketRouter {
     private static final long ESTABLISHED_IDLE_TIMEOUT_MS = 3 * 60 * 1000L;
-    private static final long CLOSING_IDLE_TIMEOUT_MS = 30 * 1000L;
+    // 半关闭排空上限：必须大于 CppRemoteKcpSession 的 120s 宽限，
+    // 否则路由器会先于会话掐断仍在接收在途数据的连接。
+    private static final long CLOSING_IDLE_TIMEOUT_MS = 150 * 1000L;
     private static final int TCP_IPV4_HEADER_LEN = 40;
     private static final int MAX_TCP_PAYLOAD_PER_PACKET = VpnConfig.VPN_MTU - TCP_IPV4_HEADER_LEN;
     private static final int UDP_TRACE_SAMPLE_RATE = 64;
@@ -248,22 +250,31 @@ public class PacketRouter {
         }
 
         if (isFin) {
+            boolean firstFin;
             synchronized (conn) {
+                firstFin = !conn.clientFinSeen;
+                conn.clientFinSeen = true;
                 conn.clientNextSeq = Math.max(conn.clientNextSeq, clientSeq + payloadLen + 1);
                 conn.state = TcpState.CLOSING;
                 conn.touch();
             }
-            sendCloseToOutbound(conn, sendFrameCallback, false);
-            byte[] finAck = buildTcpPacket(conn, new byte[0], (byte) 0x11,
-                    conn.serverNextSeq, conn.clientNextSeq);
-            writePacketCallback.onWritePacket(finAck);
-            logTcpOut(conn, 0x11, conn.serverNextSeq, conn.clientNextSeq, 0);
-            synchronized (conn) {
-                conn.serverNextSeq += 1;
+            if (firstFin) {
+                sendCloseToOutbound(conn, sendFrameCallback, false);
+                Logger.info(LogConfig.MODULE_VPN, "CLOSE frame: connectionId=" + conn.connectionId
+                        + ", src=" + conn.srcHost + ":" + conn.srcPort
+                        + ", dst=" + conn.dstHost + ":" + conn.dstPort + ", payloadLength=0");
             }
-            Logger.info(LogConfig.MODULE_VPN, "CLOSE frame: connectionId=" + conn.connectionId
-                    + ", src=" + conn.srcHost + ":" + conn.srcPort
-                    + ", dst=" + conn.dstHost + ":" + conn.dstPort + ", payloadLength=0");
+            // 半关闭：本地 FIN 只回 ACK，会话保留至远端把在途数据排空；
+            // 我们的 FIN 由远端关闭路径发出，避免重复 FIN 并丢弃尾部字节。
+            int finAckSeq;
+            int finAckAck;
+            synchronized (conn) {
+                finAckSeq = conn.serverNextSeq;
+                finAckAck = conn.clientNextSeq;
+            }
+            byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10, finAckSeq, finAckAck);
+            writePacketCallback.onWritePacket(ackPacket);
+            logTcpOut(conn, 0x10, finAckSeq, finAckAck, 0);
         }
     }
 
@@ -310,7 +321,7 @@ public class PacketRouter {
         if (payloadLen <= 0 || udpOffset + 8 + payloadLen > totalLen) {
             return;
         }
-        logUdpTrace("UDP IN src=" + addressToString(srcAddr) + ":" + srcPort
+        logUdpTrace(() -> "UDP IN src=" + addressToString(srcAddr) + ":" + srcPort
                 + " dst=" + addressToString(dstAddr) + ":" + dstPort
                 + " dstPort=" + dstPort
                 + " len=" + payloadLen, srcPort, dstPort);
@@ -348,7 +359,7 @@ public class PacketRouter {
                 byte[] udpPacket = buildUdpPacket(datagram.payload, datagram.dstAddr,
                         datagram.dstPort, datagram.srcAddr, datagram.srcPort);
                 writePacketCallback.onWritePacket(udpPacket);
-                logUdpTrace("UDP OUT src=" + addressToString(datagram.dstAddr)
+                logUdpTrace(() -> "UDP OUT src=" + addressToString(datagram.dstAddr)
                         + ":" + datagram.dstPort
                         + " dst=" + addressToString(datagram.srcAddr) + ":" + datagram.srcPort
                         + " len=" + datagram.payload.length, datagram.dstPort, datagram.srcPort);
@@ -413,6 +424,7 @@ public class PacketRouter {
                 }
                 writePacketCallback.onWritePacket(finAck);
                 logTcpOut(conn, 0x11, seq, ack, 0);
+                removeConnection(conn);
             } else if (frame.getFrameType() == KcpFrame.TYPE_RESET) {
                 byte[] rstPacket = buildTcpPacket(conn, new byte[0], (byte) 0x14,
                         conn.serverNextSeq, conn.clientNextSeq);
@@ -500,7 +512,11 @@ public class PacketRouter {
     private void sendCloseToOutbound(TcpConnection conn, SendFrameCallback sendFrameCallback, boolean reset) {
         CppRemoteTunnelManager remoteManager = cppRemoteTunnelManager;
         if (!localMode && remoteManager != null) {
-            remoteManager.closeConnection(conn.connectionId, reset ? "tcp_rst" : "tcp_fin");
+            if (reset) {
+                remoteManager.closeConnection(conn.connectionId, "tcp_rst");
+            } else {
+                remoteManager.halfCloseConnection(conn.connectionId);
+            }
             return;
         }
         sendFrameCallback.onSendFrame(new KcpFrame(reset ? KcpFrame.TYPE_RESET : KcpFrame.TYPE_CLOSE,
@@ -689,7 +705,7 @@ public class PacketRouter {
 
     private static void logTcpIn(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
                                  int flags, int seq, int ack, int len) {
-        Logger.debug(LogConfig.MODULE_VPN, "TCP IN src=" + addressToString(srcAddr) + ":" + srcPort
+        Logger.packetTrace(LogConfig.MODULE_VPN, () -> "TCP IN src=" + addressToString(srcAddr) + ":" + srcPort
                 + " dst=" + addressToString(dstAddr) + ":" + dstPort
                 + " flags=0x" + Integer.toHexString(flags)
                 + " seq=" + (seq & 0xFFFFFFFFL)
@@ -698,7 +714,7 @@ public class PacketRouter {
     }
 
     private static void logTcpOut(TcpConnection conn, int flags, int seq, int ack, int len) {
-        Logger.debug(LogConfig.MODULE_VPN, "TCP OUT src=" + conn.dstHost + ":" + conn.dstPort
+        Logger.packetTrace(LogConfig.MODULE_VPN, () -> "TCP OUT src=" + conn.dstHost + ":" + conn.dstPort
                 + " dst=" + conn.srcHost + ":" + conn.srcPort
                 + " flags=0x" + Integer.toHexString(flags)
                 + " seq=" + (seq & 0xFFFFFFFFL)
@@ -706,10 +722,10 @@ public class PacketRouter {
                 + " len=" + len);
     }
 
-    private void logUdpTrace(String message, int srcPort, int dstPort) {
+    private void logUdpTrace(java.util.function.Supplier<String> message, int srcPort, int dstPort) {
         if (srcPort == 53 || dstPort == 53
                 || udpTraceCounter.incrementAndGet() % UDP_TRACE_SAMPLE_RATE == 0) {
-            Logger.debug(LogConfig.MODULE_VPN, message);
+            Logger.packetTrace(LogConfig.MODULE_VPN, message);
         }
     }
 
@@ -727,10 +743,10 @@ public class PacketRouter {
                             Logger.info(LogConfig.MODULE_VPN, "Stale connection cleanup: connectionId="
                                     + conn.connectionId + ", state=" + conn.state
                                     + ", idleMs=" + age);
-                            conn.sendFrameCallback.onSendFrame(new KcpFrame(
-                                    conn.state == TcpState.ESTABLISHED
-                                            ? KcpFrame.TYPE_CLOSE : KcpFrame.TYPE_RESET,
-                                    conn.connectionId, null));
+                            // 必须走 sendCloseToOutbound：CPP_REMOTE 模式下裸 KcpFrame 会被丢弃，
+                            // 远端会话与 UDP socket 将一直泄漏。
+                            sendCloseToOutbound(conn, conn.sendFrameCallback,
+                                    conn.state != TcpState.ESTABLISHED);
                             removeConnection(conn);
                         }
                     }
@@ -795,6 +811,7 @@ public class PacketRouter {
         private long lastActivityTime;
         private TcpState state;
         private boolean synAckSent;
+        private boolean clientFinSeen;
         private volatile boolean closed;
 
         TcpConnection(long connectionId, String key, byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,

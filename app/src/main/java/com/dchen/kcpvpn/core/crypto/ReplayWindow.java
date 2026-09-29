@@ -1,82 +1,88 @@
 package com.dchen.kcpvpn.core.crypto;
 
+import java.util.BitSet;
+
 /**
- * 重放攻击防护 - 与 C++ crypto.cpp check_and_update_replay_window 一致
- * 使用64位滑动窗口检测重放包
+ * 重放攻击防护 - 与 C++ crypto.cpp check_replay_window/commit_replay_window 一致的
+ * 2048 位滑动窗口。check() 为纯读，commit() 必须在 AEAD 标签校验通过后调用，
+ * 防止伪造的高计数器包永久污染窗口。
  */
 public class ReplayWindow {
 
-    private static final int WINDOW_SIZE = CryptoConfig.REPLAY_WINDOW_BITS;
+    private static final int WINDOW_BITS = CryptoConfig.REPLAY_WINDOW_BITS;
 
     private long highestReceived;
-    private long replayWindow;
+    private final BitSet window;
     private boolean anyReceived;
 
     public ReplayWindow() {
         this.highestReceived = 0;
-        this.replayWindow = 0;
+        this.window = new BitSet(WINDOW_BITS);
         this.anyReceived = false;
     }
 
     /**
-     * 检查并更新重放窗口
-     * @param counter 接收到的计数器值
-     * @return true 表示有效（非重放），false 表示无效（重放或过旧）
+     * 纯读检查：counter 是否可接受（未重放、未过期）。不修改任何状态。
      */
-    public synchronized boolean checkAndUpdate(long counter) {
+    public synchronized boolean check(long counter) {
         if (!anyReceived) {
-            // 首次接收
-            anyReceived = true;
-            highestReceived = counter;
-            replayWindow = 0;
             return true;
         }
-
         if (counter > highestReceived) {
-            // 新的最高计数器，滑动窗口
-            long shift = counter - highestReceived;
-            if (shift >= WINDOW_SIZE) {
-                // 窗口完全滑动
-                replayWindow = 0;
-            } else {
-                // 滑动窗口并标记新位置
-                replayWindow = (replayWindow << shift) | (1L << (shift - 1));
-            }
-            highestReceived = counter;
             return true;
         }
-
         if (counter == highestReceived) {
-            // 与最高计数器相同，重放
             return false;
         }
-
-        // 计数器小于最高值，检查是否在窗口内
         long offset = highestReceived - counter;
-        if (offset > WINDOW_SIZE) {
-            // 太旧，超出窗口范围
+        if (offset > WINDOW_BITS) {
             return false;
         }
-
-        // 检查窗口位图
-        long bit = 1L << (offset - 1);
-        if ((replayWindow & bit) != 0) {
-            // 已经接收过，重放
-            return false;
-        }
-
-        // 标记为已接收
-        replayWindow |= bit;
-        return true;
+        return !window.get((int) (offset - 1));
     }
 
     /**
-     * 重置重放窗口
+     * 记录 counter 已接收。只允许在包通过 AEAD 认证后调用。
+     * bit i 对应计数器 (highest - i - 1)。
      */
-    public synchronized void reset() {
-        highestReceived = 0;
-        replayWindow = 0;
-        anyReceived = false;
+    public synchronized void commit(long counter) {
+        if (!anyReceived) {
+            anyReceived = true;
+            highestReceived = counter;
+            window.clear();
+            return;
+        }
+        if (counter > highestReceived) {
+            long shift = counter - highestReceived;
+            if (shift > WINDOW_BITS) {
+                window.clear();
+            } else {
+                slideLeft((int) shift);
+                window.set((int) (shift - 1));
+            }
+            highestReceived = counter;
+            return;
+        }
+        if (counter < highestReceived) {
+            long offset = highestReceived - counter;
+            if (offset <= WINDOW_BITS) {
+                window.set((int) (offset - 1));
+            }
+        }
+    }
+
+    /**
+     * 窗口整体左移 shift 位（旧 bit i 移到 i+shift，超出窗口的丢弃）。
+     */
+    private void slideLeft(int shift) {
+        BitSet snapshot = window.get(0, WINDOW_BITS);
+        window.clear();
+        for (int j = snapshot.nextSetBit(0); j >= 0; j = snapshot.nextSetBit(j + 1)) {
+            int target = j + shift;
+            if (target < WINDOW_BITS) {
+                window.set(target);
+            }
+        }
     }
 
     /**

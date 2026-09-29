@@ -24,10 +24,15 @@ Expected Android INFO logs:
 mode=CPP_REMOTE server=10.0.2.2:8388 protocol=socks5-over-kcp-raw-stream socketProtected=true
 CPP_REMOTE KCP conv=1 nodelay=1 interval=10 resend=5 nc=1 sndWnd=256 rcvWnd=512 mtu=1400 timeout=60s
 CPP_REMOTE state=STARTED detail=local VPN/tunnel manager started
+CPP_REMOTE handshake confirmed (V2, half-close enabled) connectionId=<id>
 CPP_REMOTE SOCKS5 CONNECT connectionId=<id> dst=<ip>:<port>
 CPP_REMOTE SOCKS5 response rep=0x00 connectionId=<id>
 CPP_REMOTE state=REMOTE_REACHABLE detail=valid SOCKS5 response received
 ```
+
+`handshake confirmed (V2, half-close enabled)` means the server mirrored `KCP_PROXY_HELLO_ACK_V2`.
+If it instead reads `(V1 server, half-close disabled)`, the Android client and the server disagree
+on the protocol version and the FIN half-close path is off.
 
 Expected C++ INFO logs:
 
@@ -36,9 +41,13 @@ listening on 0.0.0.0:8388
 diagnostics udp_bind=0.0.0.0 udp_port=8388 crypto=AES-128-GCM/HKDF-SHA256 socks5_mode=CONNECT_ONLY
 KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=256 rcvWnd=512 timeout=60s
 new session: <emulator-endpoint> (total: 1)
+<emulator-endpoint>: KCP handshake confirmed (V2, half-close enabled)
 SOCKS5 CONNECT dst=<ip>:<port> cmd=1
 connected to target <ip>:<port>
 ```
+
+A server that logs `no HELLO control frame; treating first KCP payload as SOCKS5 compatibility
+handshake` instead means the V2 HELLO never arrived.
 
 Chrome test URLs:
 

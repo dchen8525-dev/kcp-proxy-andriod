@@ -17,4 +17,9 @@ public class SessionConfig {
     public static final int UDP_RECV_BUF_SIZE = 65536;
     public static final int FWD_BUF_SIZE = 4096;
     public static final int SOCKS5_REPLY_BUF_SIZE = 512;
+
+    // UDP 内核缓冲（与 C++ UDP_SO_RCVBUF/SNDBUF 一致）：内核缓冲不足时突发丢包
+    // 会被 KCP 误判为网络拥塞，触发整窗重传
+    public static final int UDP_SO_RCVBUF_BYTES = 4 * 1024 * 1024;
+    public static final int UDP_SO_SNDBUF_BYTES = 4 * 1024 * 1024;
 }

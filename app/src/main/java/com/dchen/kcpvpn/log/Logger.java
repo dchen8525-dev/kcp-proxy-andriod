@@ -1,6 +1,7 @@
 package com.dchen.kcpvpn.log;
 
 import android.content.Context;
+import com.dchen.kcpvpn.BuildConfig;
 
 /**
  * 日志管理器 - 统一日志接口
@@ -101,6 +102,22 @@ public class Logger {
         Logger logger = instance;
         if (logger != null) {
             logger.log(LogLevel.INFO, module, message);
+        }
+    }
+
+    /**
+     * 逐包诊断日志：每个 TUN 报文一条，量级远大于普通 DEBUG。
+     * 由 BuildConfig.PACKET_TRACE_ENABLED 单独控制（debug 构建开启，release 关闭），
+     * 因此即使临时把 release 调到 DEBUG 级别也不会泄漏逐包数据。
+     * 用 Supplier 延迟拼装，关闭时不产生字符串开销。
+     */
+    public static void packetTrace(String module, java.util.function.Supplier<String> message) {
+        if (!BuildConfig.PACKET_TRACE_ENABLED) {
+            return;
+        }
+        Logger logger = instance;
+        if (logger != null) {
+            logger.log(LogLevel.DEBUG, module, message.get());
         }
     }
 

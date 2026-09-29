@@ -1,7 +1,6 @@
 package com.dchen.kcpvpn.server;
 
 import com.dchen.kcpvpn.core.crypto.Crypto;
-import com.dchen.kcpvpn.core.crypto.CryptoConfig;
 import com.dchen.kcpvpn.core.protocol.KcpFrame;
 import com.dchen.kcpvpn.core.session.SocketProtector;
 import com.dchen.kcpvpn.log.LogConfig;
@@ -15,6 +14,7 @@ import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -146,8 +146,25 @@ public class LocalKcpServer {
 
         ServerSession session = sessions.get(sessionId);
 
+        if (session != null && !session.getCrypto().matchesSalt(encryptedData)) {
+            // V2：salt 每会话随机，同源端口上出现不同 salt 只可能是客户端重连复用了临时端口。
+            // 先按新会话认证，认证通过才整体替换；直接丢弃异 salt 的伪造包，
+            // 否则任何错误密钥的报文都能拆掉正在使用的会话。
+            // 替换会释放一个名额，因此满员时仍要允许这条路径。
+            ServerSession reconnected = createSession(clientAddr, encryptedData, true);
+            if (reconnected == null) {
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "Foreign salt packet rejected on "
+                        + sessionId + ", existing session kept");
+                return;
+            }
+            closeSession(sessionId, session);
+            sessions.put(sessionId, reconnected);
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "Session replaced on reconnect: " + sessionId);
+            return;
+        }
+
         if (session == null) {
-            session = createSession(clientAddr, encryptedData);
+            session = createSession(clientAddr, encryptedData, false);
             if (session == null) {
                 Logger.warning(LogConfig.MODULE_KCP_SERVER, "Auth failed for " + sessionId);
                 return;
@@ -156,28 +173,66 @@ public class LocalKcpServer {
             sessions.put(sessionId, session);
             Logger.info(LogConfig.MODULE_KCP_SERVER, "New session: " + sessionId
                     + " (total: " + sessions.size() + ")");
-        } else {
-            try {
-                byte[] decrypted = session.getCrypto().decrypt(encryptedData);
-                session.receiveData(decrypted);
-            } catch (Exception e) {
-                Logger.error(LogConfig.MODULE_KCP_SERVER, "Decrypt error: " + e.getMessage());
+            return;
+        }
+
+        try {
+            byte[] decrypted = session.getCrypto().decrypt(encryptedData);
+            session.receiveData(decrypted);
+        } catch (Exception e) {
+            Logger.error(LogConfig.MODULE_KCP_SERVER, "Decrypt error: " + e.getMessage());
+        }
+    }
+
+    private void closeSession(String sessionId, ServerSession session) {
+        sessions.remove(sessionId, session);
+        session.stop();
+        connectionManager.closeSessionConnections(sessionId);
+        closeSessionUdpRelays(sessionId);
+    }
+
+    /**
+     * 会话拆除时其 UDP/DNS 中继必须一起关闭：中继 key 以 "sessionId|" 开头，
+     * 只靠空闲回收会让重连后的新会话复用已死会话的中继 socket。
+     */
+    private void closeSessionUdpRelays(String sessionId) {
+        String prefix = sessionId + "|";
+        for (String key : udpRelays.keySet()) {
+            if (key.startsWith(prefix)) {
+                UdpRelay relay = udpRelays.remove(key);
+                if (relay != null) {
+                    relay.close();
+                }
             }
         }
     }
 
-    private ServerSession createSession(InetSocketAddress clientAddr, byte[] encryptedPacket) {
-        if (sessions.size() >= ServerConfig.MAX_CONCURRENT_SESSIONS) {
+    /**
+     * @param replacingExisting true 表示这是在替换同端口的旧会话（客户端重连复用临时端口），
+     *                          旧会话随即释放名额，故满员时仍应允许。
+     */
+    private ServerSession createSession(InetSocketAddress clientAddr, byte[] encryptedPacket,
+                                        boolean replacingExisting) {
+        if (!replacingExisting && sessions.size() >= ServerConfig.MAX_CONCURRENT_SESSIONS) {
             Logger.warning(LogConfig.MODULE_KCP_SERVER, "Session cap reached: "
                     + ServerConfig.MAX_CONCURRENT_SESSIONS);
             return null;
         }
 
         try {
-            Crypto crypto = new Crypto(key, CryptoConfig.NONCE_DIR_SERVER, "");
+            // 服务端 V2：salt 从首个报文学到后再派生 per-session 密钥
+            Crypto crypto = Crypto.createServerCrypto(key);
             Logger.debug(LogConfig.MODULE_KCP_SERVER, "Crypto created for new server session: "
                     + clientAddr);
             byte[] decrypted = crypto.decrypt(encryptedPacket);
+
+            // 两个会话共用同一 salt 会派生出同一密钥且计数器序列重叠，
+            // AES-GCM 的 (key, nonce) 复用是灾难性的，必须拒绝。
+            if (isSaltAlreadyInUse(crypto.sessionSalt())) {
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "Duplicate session salt rejected from "
+                        + clientAddr);
+                return null;
+            }
 
             ServerSession session = new ServerSession(clientAddr, crypto);
             session.setSendCallback(data -> sendToClient(clientAddr, data));
@@ -190,6 +245,15 @@ public class LocalKcpServer {
             Logger.debug(LogConfig.MODULE_KCP_SERVER, "Auth failed: " + e.getMessage());
             return null;
         }
+    }
+
+    private boolean isSaltAlreadyInUse(byte[] salt) {
+        for (ServerSession existing : sessions.values()) {
+            if (Arrays.equals(existing.getCrypto().sessionSalt(), salt)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void handleFrame(ServerSession session, KcpFrame frame) {
@@ -401,9 +465,7 @@ public class LocalKcpServer {
                         ServerSession session = entry.getValue();
                         if (!session.isAlive()) {
                             Logger.info(LogConfig.MODULE_KCP_SERVER, "Cleaning up dead session: " + entry.getKey());
-                            session.stop();
-                            connectionManager.closeSessionConnections(entry.getKey());
-                            sessions.remove(entry.getKey());
+                            closeSession(entry.getKey(), session);
                         }
                     }
                     for (Map.Entry<String, UdpRelay> entry : udpRelays.entrySet()) {
