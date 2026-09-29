@@ -24,3 +24,5 @@ Thumbs.db
 
 # Log files
 *.log
+# JVM 单元测试用的本地脚手架（无 Android SDK 时用 javac+junit 直接跑 app 的纯 Java 子集）
+.jvmtest/

@@ -105,6 +105,15 @@ public class CppRemoteTunnelManager {
         }
     }
 
+    /**
+     * 该连接在隧道侧是否仍有活会话。PacketRouter 用它区分"空闲但健康"和
+     * "远端已经没了、只剩本地映射"——前者不该被空闲回收掐断。
+     */
+    public boolean hasSession(long connectionId) {
+        CppRemoteKcpSession session = sessions.get(connectionId);
+        return session != null && !session.isClosed();
+    }
+
     public void sendData(long connectionId, byte[] data) {
         CppRemoteKcpSession session = sessions.get(connectionId);
         if (session == null) {

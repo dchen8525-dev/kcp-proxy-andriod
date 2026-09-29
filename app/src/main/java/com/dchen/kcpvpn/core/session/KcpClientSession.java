@@ -14,7 +14,9 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
+import java.util.ArrayDeque;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -23,11 +25,19 @@ import java.util.function.Consumer;
  */
 public class KcpClientSession {
 
+    // 背压排队上限：ikcp_send 只是把数据切段追加进 snd_queue，本身不设界，
+    // 链路停摆时会一路吃内存。超过即判定会话不可恢复，明确关闭而不是无限增长。
+    // 与 CppRemoteKcpSession 的同类上限保持一致。
+    private static final int SEND_QUEUE_LIMIT_BYTES = 2 * 1024 * 1024;
+
     private final String sessionId;
     private final InetSocketAddress serverAddr;
     private final Crypto crypto;
     private final Kcp kcp;
     private final Object kcpLock;
+    private final Object outboundLock = new Object();
+    private final Queue<byte[]> outboundQueue = new ArrayDeque<>();
+    private int outboundBytes;
     private final KcpFrameCodec frameCodec;
 
     private DatagramSocket udpSocket;
@@ -145,6 +155,7 @@ public class KcpClientSession {
                         kcp.update((int) (nowMs & 0xFFFFFFFFL));
                         kcp.flush();
                     }
+                    drainOutboundQueue();
                     Thread.sleep(KcpConfig.KCP_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     break;
@@ -281,24 +292,81 @@ public class KcpClientSession {
         }
 
         byte[] data = KcpFrameCodec.encode(frame);
-        synchronized (kcpLock) {
-            int ret = kcp.send(data);
-            if (ret < 0) {
-                Logger.warning(LogConfig.MODULE_KCP_CLIENT, "ikcp_send returned " + ret
-                        + " (queue may be full), connectionId=" + frame.getConnectionId()
-                        + ", frameType=" + KcpFrame.frameTypeName(frame.getFrameType())
-                        + ", payloadLength=" + frame.getPayloadLength());
+        boolean overflow;
+        int queuedBytes;
+        synchronized (outboundLock) {
+            // 只有队列为空且 KCP 尚有余量才能直接写入；队列非空时必须继续排队，
+            // 否则新帧会插到已排队数据前面，打乱 KCP 字节流顺序。
+            if (outboundQueue.isEmpty() && hasSendCapacity()) {
+                writeThroughKcp(data);
+                logFrameSent(frame);
                 return;
             }
-
-            kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
-            kcp.flush();
+            overflow = outboundBytes + data.length > SEND_QUEUE_LIMIT_BYTES;
+            queuedBytes = outboundBytes;
+            if (!overflow) {
+                outboundQueue.add(data);
+                outboundBytes += data.length;
+            }
         }
 
+        if (overflow) {
+            Logger.error(LogConfig.MODULE_KCP_CLIENT, "KCP_SEND_QUEUE_OVERFLOW connectionId="
+                    + frame.getConnectionId() + " queuedBytes=" + queuedBytes
+                    + " len=" + data.length);
+            close();
+            return;
+        }
+        Logger.debug(LogConfig.MODULE_KCP_CLIENT, "FRAME QUEUED by backpressure type="
+                + KcpFrame.frameTypeName(frame.getFrameType())
+                + " connectionId=" + frame.getConnectionId()
+                + " len=" + frame.getPayloadLength() + " queuedBytes=" + outboundBytes);
+    }
+
+    private void logFrameSent(KcpFrame frame) {
         Logger.info(LogConfig.MODULE_KCP_CLIENT, "FRAME SEND type="
                 + KcpFrame.frameTypeName(frame.getFrameType())
                 + " connectionId=" + frame.getConnectionId()
                 + " len=" + frame.getPayloadLength());
+    }
+
+    /** KCP 发送队列余量判据，与 C++ 的 wait_send &lt; KCP_BACKPRESSURE_THRESHOLD 同构。 */
+    private boolean hasSendCapacity() {
+        synchronized (kcpLock) {
+            return kcp.waitSend() < KcpConfig.KCP_BACKPRESSURE_THRESHOLD;
+        }
+    }
+
+    private void writeThroughKcp(byte[] data) {
+        synchronized (kcpLock) {
+            int ret = kcp.send(data);
+            if (ret < 0) {
+                Logger.warning(LogConfig.MODULE_KCP_CLIENT, "ikcp_send returned " + ret
+                        + " (invalid argument), len=" + data.length);
+                return;
+            }
+            kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
+            kcp.flush();
+        }
+    }
+
+    /**
+     * 更新线程把排队的出站帧按序补进 KCP，直到重新触及阈值。
+     * 取出元素后必须仍在 outboundLock 内写 KCP：若先释放锁再写，并发的 sendFrame
+     * 会看到队列已空且有余量而直接写入，抢到它前面，打乱字节流顺序。
+     * 锁序 outboundLock → kcpLock 与 sendFrame 一致，不会成环。
+     */
+    private void drainOutboundQueue() {
+        while (running) {
+            synchronized (outboundLock) {
+                if (outboundQueue.isEmpty() || !hasSendCapacity()) {
+                    return;
+                }
+                byte[] next = outboundQueue.remove();
+                outboundBytes -= next.length;
+                writeThroughKcp(next);
+            }
+        }
     }
 
     public void setOnFrameReceived(Consumer<KcpFrame> callback) {

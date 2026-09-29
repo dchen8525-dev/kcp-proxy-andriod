@@ -32,6 +32,23 @@ public class VpnStartConfigTest {
     }
 
     @Test
+    public void validateRejectsRemoteKeyBelowServerMinimum() {
+        // C++ main_server.cpp / main_client.cpp 要求 key.size() >= 16
+        VpnStartConfig.ValidationResult result =
+                VpnStartConfig.validate("vpn.example.com", 8388, "123456789012345", false);
+
+        assertFalse(result.valid);
+    }
+
+    @Test
+    public void validateAcceptsRemoteKeyAtServerMinimum() {
+        VpnStartConfig.ValidationResult result =
+                VpnStartConfig.validate("vpn.example.com", 8388, "1234567890123456", false);
+
+        assertTrue(result.valid);
+    }
+
+    @Test
     public void validateAcceptsLocalModeTestKey() {
         VpnStartConfig.ValidationResult result =
                 VpnStartConfig.validate("127.0.0.1", 8443, "test-key", true);

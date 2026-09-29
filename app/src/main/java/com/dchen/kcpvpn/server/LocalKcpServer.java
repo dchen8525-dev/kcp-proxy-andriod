@@ -47,6 +47,15 @@ public class LocalKcpServer {
         }
     }
 
+    /**
+     * 释放静态引用。传入的 protector 是捕获了 KcpVpnService.this 的匿名类，而这里是
+     * static 字段——不清掉的话整个 Service 实例会被留到进程结束（旋转屏幕/重启服务
+     * 反复累积）。KcpVpnService.closeVpn() 负责调用。
+     */
+    public static void clearSocketProtector() {
+        socketProtector = null;
+    }
+
     private final String host;
     private final int port;
     private final String key;

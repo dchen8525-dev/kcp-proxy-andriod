@@ -16,11 +16,14 @@ public class Kcp {
     // KCP 常量
     private static final int IKCP_RTO_NDL = 30;    // nodelay 模式最小 RTO
     private static final int IKCP_RTO_DEF = 200;    // 默认 RTO
-    private static final int IKCP_RTO_MIN = 100;    // 最小 RTO
+    private static final int IKCP_RTO_MIN = 100;    // 最小 RTO（非 nodelay 模式的 rx_minrto）
+    private static final int IKCP_RTO_MAX = 60000;  // RTO 上限（ikcp.c IKCP_RTO_MAX）
     private static final int IKCP_THRESH_INIT = 2;   // 慢启动初始阈值
     private static final int IKCP_THRESH_MIN = 2;    // 最小阈值
     private static final int IKCP_DEADLINK = 20;     // 死链判定（与 C 一致）
     private static final int IKCP_FASTACK_LIMIT = 5; // 快速重传次数限制（与 ikcp.h 一致）
+    private static final int IKCP_PROBE_INIT = 5000;    // 零窗口探测初值（ikcp.c IKCP_PROBE_INIT）
+    private static final int IKCP_PROBE_LIMIT = 120000; // 零窗口探测上限（ikcp.c IKCP_PROBE_LIMIT）
 
     // KCP 状态
     private int conv;
@@ -122,7 +125,7 @@ public class Kcp {
             this.rx_minrto = IKCP_RTO_NDL;    // nodelay 模式下 rx_minrto = 30ms
             this.fastresend = resend;           // resend 映射到 fastresend
         } else {
-            this.rx_minrto = IKCP_RTO_DEF;     // 非nodelay 模式 rx_minrto = 200ms
+            this.rx_minrto = IKCP_RTO_MIN;     // 非nodelay 模式 rx_minrto = IKCP_RTO_MIN（100ms）
             this.fastresend = 0;
         }
 
@@ -294,6 +297,9 @@ public class Kcp {
         long oldSndUna = snd_una;
         int maxack = 0;
         int latestTs = 0;
+        // ikcp.c 用显式 flag 标记"是否见过 ACK"，而不是拿 maxack > 0 当哨兵：
+        // 序号是 32 位无符号量，sn == 0 或落在 [2^31, 2^32) 时裸有符号比较会误判。
+        boolean hasMaxAck = false;
 
         ByteBuffer buf = ByteBuffer.wrap(data, offset, len);
         buf.order(ByteOrder.LITTLE_ENDIAN);
@@ -331,8 +337,14 @@ public class Kcp {
                     }
                     handleAck(sn);
                     shrinkSndBuf();
-                    // 跟踪最大 ACK 用于批量 fastack
-                    if (timeDiff(sn, maxack) > 0) {
+                    // 跟踪最大 ACK 用于批量 fastack。该版本 ikcp.c 定义了
+                    // IKCP_FASTACK_CONSERVE：只有 sn 和 ts 同时递增才推进 maxack，
+                    // 否则乱序/丢包时会多计 fastack 并发出 C 对端不会发的伪快速重传。
+                    if (!hasMaxAck) {
+                        hasMaxAck = true;
+                        maxack = sn;
+                        latestTs = ts;
+                    } else if (timeDiff(sn, maxack) > 0 && timeDiff(ts, latestTs) > 0) {
                         maxack = sn;
                         latestTs = ts;
                     }
@@ -359,8 +371,8 @@ public class Kcp {
         }
 
         // 批量 fastack：使用最大 ACK 号一次性处理
-        if (maxack > 0) {
-            parseFastAck(maxack);
+        if (hasMaxAck) {
+            parseFastAck(maxack, latestTs);
         }
 
         // cwnd 增长逻辑（与 ikcp.c ikcp_input 一致）
@@ -415,7 +427,7 @@ public class Kcp {
     /**
      * 更新 fastack — 对已确认段之前的未确认段增加 fastack
      */
-    private void parseFastAck(int sn) {
+    private void parseFastAck(int sn, int ts) {
         if (timeDiff(sn, snd_una) < 0 || timeDiff(sn, snd_nxt) >= 0) {
             return;
         }
@@ -424,8 +436,15 @@ public class Kcp {
             if (timeDiff(sn, seg.sn) < 0) {
                 break;
             }
+            if (seg.sn == sn) {
+                continue;  // 该段已被 handleAck 移除；与 C 的 `else if (sn != seg->sn)` 等价
+            }
             if (timeDiff(seg.sn, snd_una) >= 0) {
-                seg.fastack++;
+                // IKCP_FASTACK_CONSERVE：只有携带的 ts 不早于该段的发送时刻才计数，
+                // 避免把纯粹乱序到达的 ACK 误当成拥塞信号。
+                if (timeDiff(ts, seg.ts) >= 0) {
+                    seg.fastack++;
+                }
             }
         }
     }
@@ -444,7 +463,9 @@ public class Kcp {
         }
 
         int rto = rx_srtt + Math.max(interval, rx_rttval * 4);
-        rx_rto = Math.max(rx_minrto, Math.min(rto, 6000));
+        // 上限必须是 IKCP_RTO_MAX(60000)，不是 6000：ikcp.c 用 _ibound_(rx_minrto, rto, IKCP_RTO_MAX)。
+        // 6000 会让本端在高 RTT/丢包链路上比 C 对端激进约 10 倍地重传。
+        rx_rto = Math.max(rx_minrto, Math.min(rto, IKCP_RTO_MAX));
     }
 
     /**
@@ -479,17 +500,24 @@ public class Kcp {
         // 更新远端窗口
         rmt_wnd = wnd;
 
-        // 添加到 ACK 列表（需要发回给对端）
-        ackList.add(sn, ts);
-
+        // 必须先消费 payload：解析循环靠 buf 的位置推进，提前 return 会让后续分段错位。
         byte[] payload = new byte[segLen];
         if (segLen > 0) {
             buf.get(payload, 0, segLen);
         }
 
-        // 检查序列号是否在接收窗口内
-        if (timeDiff(sn, rcv_nxt + rcv_wnd) >= 0 || timeDiff(sn, rcv_nxt) < 0) {
-            // 超出窗口，但仍然发 ACK
+        // 与 ikcp.c 一致：ACK 必须放在窗口检查之内（ikcp.c 把 ikcp_ack_push 包在
+        // _itimediff(sn, rcv_nxt + rcv_wnd) < 0 里）。原实现在检查之前无条件入队，
+        // 于是会为自己丢弃的窗口外分段回 ACK；对端 ikcp_parse_ack 据此把该 sn 从
+        // snd_buf 删除，那段数据永远不会重传 —— 静默丢字节。
+        if (timeDiff(sn, rcv_nxt + rcv_wnd) >= 0) {
+            return;  // 超出接收窗口：丢弃且不 ACK
+        }
+
+        ackList.add(sn, ts);
+
+        // sn < rcv_nxt 的重复分段 C 同样回 ACK（否则对端会一直重传），只是不入队。
+        if (timeDiff(sn, rcv_nxt) < 0) {
             return;
         }
 
@@ -580,14 +608,20 @@ public class Kcp {
             flush();
         }
 
-        // 窗口探测
+        // 窗口探测 —— 常量与增长律必须与 ikcp.c 一致（PROBE_INIT=5000，
+        // 每次 +50% 而非 ×2，上限 PROBE_LIMIT=120000）。原实现 2000/×2/封顶 8000
+        // 会让零窗口恢复的节奏与 C 对端分叉。
         if (rmt_wnd == 0) {
             if (probe_wait == 0) {
-                probe_wait = 2000;  // 2 秒初始探测间隔
+                probe_wait = IKCP_PROBE_INIT;
                 ts_probe = current + probe_wait;
             } else if (timeDiff(current, ts_probe) >= 0) {
-                if (probe_wait < 8000) {
-                    probe_wait *= 2;  // 指数退避
+                if (probe_wait < IKCP_PROBE_INIT) {
+                    probe_wait = IKCP_PROBE_INIT;
+                }
+                probe_wait += probe_wait / 2;
+                if (probe_wait > IKCP_PROBE_LIMIT) {
+                    probe_wait = IKCP_PROBE_LIMIT;
                 }
                 ts_probe = current + probe_wait;
                 probe |= 1;  // IKCP_ASK_SEND: 请求窗口探测
@@ -712,7 +746,12 @@ public class Kcp {
             seg.una = una;
             seg.resendts = current + rx_rto;
             seg.rto = rx_rto;
-            seg.xmit = 0;  // 首次发送，xmit=0（与 C++ 一致）
+            // xmit 必须置 1，不能是 0。ikcp.c 里 xmit=0 是"尚未发送"的标记，
+            // 由紧随其后的 flush 数据循环负责发出并自增到 1；本实现在这个循环里
+            // 就调用了 sendSegment()，若仍留 0，下一轮 flush 会再次命中
+            // `xmit == 0` 的首次发送分支，把每个分段都重发一遍（UDP 出站量翻倍、
+            // 有效吞吐接近腰斩），并且 xmit 被多加一次导致 dead_link 提前触发。
+            seg.xmit = 1;
             seg.fastack = 0;
             snd_buf.add(seg);
             sendSegment(seg);

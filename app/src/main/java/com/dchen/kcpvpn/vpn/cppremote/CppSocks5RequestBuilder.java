@@ -10,15 +10,46 @@ public final class CppSocks5RequestBuilder {
     private CppSocks5RequestBuilder() {
     }
 
+    /**
+     * 按目标地址长度选择 ATYP：4 字节 → 0x01（IPv4），16 字节 → 0x04（IPv6）。
+     * 服务端 address.cpp / socks5.cpp 两条分支都支持，所以调用方不必关心地址族。
+     */
+    public static byte[] buildConnect(byte[] dstAddr, int dstPort) {
+        if (dstAddr == null) {
+            throw new IllegalArgumentException("missing SOCKS5 CONNECT destination address");
+        }
+        if (dstAddr.length == 4) {
+            return buildIpv4Connect(dstAddr, dstPort);
+        }
+        if (dstAddr.length == 16) {
+            return buildIpv6Connect(dstAddr, dstPort);
+        }
+        throw new IllegalArgumentException("unsupported SOCKS5 CONNECT address length: " + dstAddr.length);
+    }
+
     public static byte[] buildIpv4Connect(byte[] dstAddr, int dstPort) {
         if (dstAddr == null || dstAddr.length != 4) {
-            throw new IllegalArgumentException("CPP_REMOTE only supports IPv4 SOCKS5 CONNECT");
+            throw new IllegalArgumentException("IPv4 SOCKS5 CONNECT requires a 4-byte address");
         }
         ByteBuffer buf = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN);
         buf.put((byte) 0x05);
         buf.put((byte) 0x01);
         buf.put((byte) 0x00);
         buf.put((byte) 0x01);
+        buf.put(dstAddr);
+        buf.putShort((short) dstPort);
+        return buf.array();
+    }
+
+    public static byte[] buildIpv6Connect(byte[] dstAddr, int dstPort) {
+        if (dstAddr == null || dstAddr.length != 16) {
+            throw new IllegalArgumentException("IPv6 SOCKS5 CONNECT requires a 16-byte address");
+        }
+        ByteBuffer buf = ByteBuffer.allocate(22).order(ByteOrder.BIG_ENDIAN);
+        buf.put((byte) 0x05);
+        buf.put((byte) 0x01);
+        buf.put((byte) 0x00);
+        buf.put((byte) 0x04);
         buf.put(dstAddr);
         buf.putShort((short) dstPort);
         return buf.array();

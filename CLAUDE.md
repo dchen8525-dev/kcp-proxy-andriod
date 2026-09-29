@@ -67,7 +67,8 @@ PacketRouter maintains a `ConcurrentHashMap<Integer, SocketConnection>` keyed by
 | KCP_TIMEOUT | 60s | KcpConfig |
 | KCP nodelay | enabled, interval=10, fastresend=5, nocwnd=1 | KcpConfig |
 | Default conv | 1 | KcpConfig |
-| Backpressure threshold | 512 (= SNDWND * 2) | KcpConfig |
+| Backpressure threshold | 236 (= SNDWND − MAX_SEGMENTS_PER_MSG − 8) | KcpConfig |
+| FWD_BUF_SIZE | 16384 (must equal C++ config.hpp) | SessionConfig |
 | APP_SALT | "kcp-proxy-hkdf-salt-v1" | CryptoConfig |
 | HKDF info C2S | "kcp-proxy/c2s/v1" | CryptoConfig |
 | HKDF info S2C | "kcp-proxy/s2c/v1" | CryptoConfig |
@@ -75,7 +76,7 @@ PacketRouter maintains a `ConcurrentHashMap<Integer, SocketConnection>` keyed by
 | Nonce direction | CLIENT=0x01, SERVER=0x02 | CryptoConfig |
 | AES key size | 128-bit (16 bytes) | CryptoConfig |
 | Max counter | 2^48 (IND-CPA safety limit) | CryptoConfig |
-| Replay window | 64 bits | ReplayWindow / CryptoConfig |
+| Replay window | 2048 bits | ReplayWindow / CryptoConfig |
 
 ### Crypto Flow
 
@@ -126,8 +127,10 @@ Use `LogConfig.MODULE_*` constants: `vpn`, `kcp_client`, `kcp_server`, `crypto`,
 
 ## Testing Compatibility with C++ Server
 
-When making changes to protocol logic, verify against the C++ reference implementation:
-1. CryptoConfig constants match `native/core/include/kcp_proxy/config.hpp`
-2. Crypto.java logic matches `native/core/src/crypto.cpp`
-3. SOCKS5 format matches `native/core/src/socks5.cpp` and `address.cpp`
-4. KCP parameters match `native/third_party/kcp/ikcp.h` defaults
+The C++ reference implementation lives in a separate checkout (`kcp-proxy-cpp`), not in this
+repository — there is no `native/` directory here. When making changes to protocol logic, verify
+against that tree:
+1. CryptoConfig constants match `src/kcp_proxy/config.hpp`
+2. Crypto.java logic matches `src/kcp_proxy/crypto.cpp`
+3. SOCKS5 format matches `src/kcp_proxy/socks5.cpp` and `src/kcp_proxy/address.cpp`
+4. KCP parameters match the vendored `ikcp.c` / `ikcp.h` (see that repo's `vcpkg.json` for the pinned commit)

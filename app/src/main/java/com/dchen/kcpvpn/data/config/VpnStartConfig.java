@@ -23,8 +23,11 @@ public final class VpnStartConfig {
         if (key == null || key.trim().isEmpty()) {
             return ValidationResult.invalid("CONFIG_INVALID", "密钥不能为空", "填写与服务端一致的密钥。");
         }
-        if (!localMode && key.trim().length() < 8) {
-            return ValidationResult.invalid("CONFIG_INVALID", "远程模式密钥过短", "使用至少 8 个字符的远程密钥。");
+        // 与 C++ 服务端/客户端一致：main_server.cpp / main_client.cpp 都要求
+        // key.size() >= 16，短于 16 的密钥在服务端启动阶段就会被拒绝。这里放行
+        // 只会让用户在隧道建不起来之后才去翻日志。
+        if (!localMode && key.trim().length() < 16) {
+            return ValidationResult.invalid("CONFIG_INVALID", "远程模式密钥过短", "使用至少 16 个字符的远程密钥。");
         }
         return ValidationResult.valid();
     }

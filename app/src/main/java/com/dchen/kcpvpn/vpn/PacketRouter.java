@@ -5,6 +5,7 @@ import com.dchen.kcpvpn.core.protocol.Socks5Request;
 import com.dchen.kcpvpn.core.session.SocketProtector;
 import com.dchen.kcpvpn.log.LogConfig;
 import com.dchen.kcpvpn.log.Logger;
+import com.dchen.kcpvpn.vpn.cppremote.CppRemoteKcpSession;
 import com.dchen.kcpvpn.vpn.cppremote.CppRemoteTunnelManager;
 
 import java.net.DatagramPacket;
@@ -25,7 +26,15 @@ public class PacketRouter {
     // 否则路由器会先于会话掐断仍在接收在途数据的连接。
     private static final long CLOSING_IDLE_TIMEOUT_MS = 150 * 1000L;
     private static final int TCP_IPV4_HEADER_LEN = 40;
+    private static final int IPV4_HEADER_LEN = 20;
+    private static final int IPV6_HEADER_LEN = 40;
+    private static final int IPV6_ADDR_LEN = 16;
+    private static final int TCP_HEADER_LEN = 20;
     private static final int MAX_TCP_PAYLOAD_PER_PACKET = VpnConfig.VPN_MTU - TCP_IPV4_HEADER_LEN;
+    // IPv6 头比 IPv4 长 20 字节，同样的 MTU 下每个包要少装 20 字节负载，
+    // 否则写进 TUN 的包会超过 MTU 被内核丢弃。
+    private static final int MAX_TCP_PAYLOAD_PER_PACKET_IPV6 =
+            VpnConfig.VPN_MTU - IPV6_HEADER_LEN - TCP_HEADER_LEN;
     private static final int UDP_TRACE_SAMPLE_RATE = 64;
 
     private final Map<String, TcpConnection> connectionsByKey = new ConcurrentHashMap<>();
@@ -37,6 +46,7 @@ public class PacketRouter {
     private volatile boolean localMode;
     private volatile SocketProtector socketProtector;
     private volatile CppRemoteTunnelManager cppRemoteTunnelManager;
+    private volatile java.util.function.BooleanSupplier tunnelAliveSupplier;
     private Thread cleanupThread;
 
     public void setSocketProtector(SocketProtector protector) {
@@ -49,6 +59,11 @@ public class PacketRouter {
 
     public void setCppRemoteTunnelManager(CppRemoteTunnelManager cppRemoteTunnelManager) {
         this.cppRemoteTunnelManager = cppRemoteTunnelManager;
+    }
+
+    /** 本地模式的隧道存活判据（TunnelManager::isConnected）。 */
+    public void setTunnelAliveSupplier(java.util.function.BooleanSupplier supplier) {
+        this.tunnelAliveSupplier = supplier;
     }
 
     public void start() {
@@ -85,30 +100,63 @@ public class PacketRouter {
         try {
             ByteBuffer buf = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN);
             int version = (buf.get(0) >> 4) & 0x0F;
-            if (version != 4) {
+
+            int ipHeaderLen;
+            int totalLen;
+            int protocol;
+            byte[] srcAddr;
+            byte[] dstAddr;
+
+            if (version == 4) {
+                ipHeaderLen = (buf.get(0) & 0x0F) * 4;
+                if (packet.length < ipHeaderLen + 8) {
+                    return;
+                }
+
+                totalLen = buf.getShort(2) & 0xFFFF;
+                if (totalLen <= 0 || totalLen > packet.length) {
+                    totalLen = packet.length;
+                }
+
+                int flagsAndFragment = buf.getShort(6) & 0xFFFF;
+                if ((flagsAndFragment & 0x2000) != 0 || ((flagsAndFragment & 0x1FFF) << 3) != 0) {
+                    Logger.debug(LogConfig.MODULE_VPN, "Ignoring fragmented IP packet");
+                    return;
+                }
+
+                srcAddr = Arrays.copyOfRange(packet, 12, 16);
+                dstAddr = Arrays.copyOfRange(packet, 16, 20);
+                protocol = buf.get(9) & 0xFF;
+            } else if (version == 6) {
+                if (packet.length < IPV6_HEADER_LEN + 8) {
+                    return;
+                }
+
+                // IPv6 固定 40 字节头：没有 IHL、没有头校验和；负载长度字段不含头本身。
+                ipHeaderLen = IPV6_HEADER_LEN;
+                int payloadLength = buf.getShort(4) & 0xFFFF;
+                totalLen = payloadLength + IPV6_HEADER_LEN;
+                if (totalLen > packet.length) {
+                    totalLen = packet.length;
+                }
+
+                protocol = buf.get(6) & 0xFF;
+                // 扩展头会把"上层协议"挤到后面的 next header 里，分片头则意味着我们
+                // 手里只是一个片段。两者都直接丢弃——与 IPv4 路径丢弃分片的策略一致，
+                // 也好过按错误偏移去解析 TCP。
+                if (isIpv6ExtensionHeader(protocol)) {
+                    Logger.debug(LogConfig.MODULE_VPN,
+                            "Ignoring IPv6 packet with extension header nextHeader=" + protocol);
+                    return;
+                }
+
+                srcAddr = Arrays.copyOfRange(packet, 8, 24);
+                dstAddr = Arrays.copyOfRange(packet, 24, 40);
+            } else {
                 return;
             }
 
-            int ipHeaderLen = (buf.get(0) & 0x0F) * 4;
-            if (packet.length < ipHeaderLen + 8) {
-                return;
-            }
-
-            int totalLen = buf.getShort(2) & 0xFFFF;
-            if (totalLen <= 0 || totalLen > packet.length) {
-                totalLen = packet.length;
-            }
-
-            int flagsAndFragment = buf.getShort(6) & 0xFFFF;
-            if ((flagsAndFragment & 0x2000) != 0 || ((flagsAndFragment & 0x1FFF) << 3) != 0) {
-                Logger.debug(LogConfig.MODULE_VPN, "Ignoring fragmented IP packet");
-                return;
-            }
-
-            byte[] srcAddr = Arrays.copyOfRange(packet, 12, 16);
-            byte[] dstAddr = Arrays.copyOfRange(packet, 16, 20);
-            byte protocol = buf.get(9);
-            Logger.debug(LogConfig.MODULE_VPN, "PacketRouter parse protocol=" + (protocol & 0xFF)
+            Logger.debug(LogConfig.MODULE_VPN, "PacketRouter parse protocol=" + protocol
                     + " src=" + addressToString(srcAddr)
                     + " dst=" + addressToString(dstAddr)
                     + " len=" + totalLen);
@@ -314,6 +362,15 @@ public class PacketRouter {
         if (totalLen < udpOffset + 8) {
             return;
         }
+        // UDP 只走 IPv4：CPP_REMOTE 仅中继 DNS，且上游固定为 IPv4 的 1.1.1.1；
+        // 本地模式的中继帧格式（buildUdpFramePayload）也按 4 字节地址编码。
+        // IPv6 的 UDP（QUIC、mDNS 等）与既有的"非 DNS UDP"策略保持一致——直接丢弃。
+        // DNS 不受影响：Builder 里通告的解析器是 IPv4 的 1.1.1.1 / 8.8.8.8。
+        if (srcAddr.length != 4 || dstAddr.length != 4) {
+            Logger.debug(LogConfig.MODULE_VPN, "Ignoring IPv6 UDP dst="
+                    + addressToString(dstAddr) + ":" + (buf.getShort(udpOffset + 2) & 0xFFFF));
+            return;
+        }
         int srcPort = buf.getShort(udpOffset) & 0xFFFF;
         int dstPort = buf.getShort(udpOffset + 2) & 0xFFFF;
         int udpLen = buf.getShort(udpOffset + 4) & 0xFFFF;
@@ -396,7 +453,7 @@ public class PacketRouter {
                 synchronized (conn) {
                     int offset = 0;
                     while (offset < payload.length) {
-                        int segmentLen = Math.min(MAX_TCP_PAYLOAD_PER_PACKET, payload.length - offset);
+                        int segmentLen = Math.min(maxTcpPayload(conn), payload.length - offset);
                         byte[] segment = Arrays.copyOfRange(payload, offset, offset + segmentLen);
                         int seq = conn.serverNextSeq;
                         byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
@@ -450,7 +507,7 @@ public class PacketRouter {
             synchronized (conn) {
                 int offset = 0;
                 while (offset < payload.length) {
-                    int segmentLen = Math.min(MAX_TCP_PAYLOAD_PER_PACKET, payload.length - offset);
+                    int segmentLen = Math.min(maxTcpPayload(conn), payload.length - offset);
                     byte[] segment = Arrays.copyOfRange(payload, offset, offset + segmentLen);
                     int seq = conn.serverNextSeq;
                     byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
@@ -482,7 +539,11 @@ public class PacketRouter {
             int flags;
             synchronized (conn) {
                 conn.state = TcpState.CLOSING;
-                flags = reason != null && reason.contains("FAILED") ? 0x14 : 0x11;
+                // 用 CppRemoteKcpSession 的显式白名单判定，而不是在 reason 里找
+                // "FAILED" 子串：SESSION_TIMEOUT / CPP_SERVER_NO_RESPONSE /
+                // CRYPTO_MISMATCH / KCP_BACKPRESSURE_OVERFLOW 都是失败但不含
+                // "FAILED"，旧写法会回 FIN，应用看到干净 EOF 而察觉不到截断。
+                flags = CppRemoteKcpSession.isGracefulCloseReason(reason) ? 0x11 : 0x14;
                 packet = buildTcpPacket(conn, new byte[0], (byte) flags,
                         conn.serverNextSeq, conn.clientNextSeq);
                 if (flags == 0x11) {
@@ -554,26 +615,63 @@ public class PacketRouter {
         }, "CPP-DNS-Relay").start();
     }
 
+    /**
+     * 隧道侧是否还有活会话。用于把"空闲但健康"和"远端已消失、只剩本地映射"
+     * 区分开：前者不该被空闲回收掐断。
+     * CPP_REMOTE 走 manager 的会话表；本地模式走注入的存活判据（TunnelManager）。
+     */
+    private boolean isTunnelAlive(TcpConnection conn) {
+        CppRemoteTunnelManager remoteManager = cppRemoteTunnelManager;
+        if (!localMode && remoteManager != null) {
+            return remoteManager.hasSession(conn.connectionId);
+        }
+        java.util.function.BooleanSupplier supplier = tunnelAliveSupplier;
+        return supplier != null && supplier.getAsBoolean();
+    }
+
     private void removeConnection(TcpConnection conn) {
         conn.close();
         connectionsByKey.remove(conn.key);
         connectionsById.remove(conn.connectionId);
     }
 
+    /** 该连接的 IP 族对应的单包最大 TCP 负载（保证 头 + TCP头 + 负载 ≤ MTU）。 */
+    private static int maxTcpPayload(TcpConnection conn) {
+        return conn.dstAddr.length == IPV6_ADDR_LEN
+                ? MAX_TCP_PAYLOAD_PER_PACKET_IPV6
+                : MAX_TCP_PAYLOAD_PER_PACKET;
+    }
+
     private byte[] buildTcpPacket(TcpConnection conn, byte[] payload, byte tcpFlags, int seq, int ack) {
-        int totalLen = 20 + 20 + payload.length;
+        boolean ipv6 = conn.dstAddr.length == IPV6_ADDR_LEN;
+        int ipHeaderLen = ipv6 ? IPV6_HEADER_LEN : IPV4_HEADER_LEN;
+        int tcpLen = TCP_HEADER_LEN + payload.length;
+        int totalLen = ipHeaderLen + tcpLen;
         byte[] packet = new byte[totalLen];
         ByteBuffer buf = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN);
-        buf.put((byte) 0x45);
-        buf.put((byte) 0);
-        buf.putShort((short) totalLen);
-        buf.putShort((short) 0);
-        buf.putShort((short) 0x4000);
-        buf.put((byte) 64);
-        buf.put((byte) 6);
-        buf.putShort((short) 0);
-        buf.put(conn.dstAddr);
-        buf.put(conn.srcAddr);
+        if (ipv6) {
+            // 版本(4) + traffic class(8) + flow label(20) = 前 4 字节
+            buf.put((byte) 0x60);
+            buf.put((byte) 0);
+            buf.put((byte) 0);
+            buf.put((byte) 0);
+            buf.putShort((short) tcpLen);   // payload length：不含 40 字节头
+            buf.put((byte) 6);              // next header = TCP
+            buf.put((byte) 64);             // hop limit
+            buf.put(conn.dstAddr);          // src = 远端目标
+            buf.put(conn.srcAddr);          // dst = 本机
+        } else {
+            buf.put((byte) 0x45);
+            buf.put((byte) 0);
+            buf.putShort((short) totalLen);
+            buf.putShort((short) 0);
+            buf.putShort((short) 0x4000);
+            buf.put((byte) 64);
+            buf.put((byte) 6);
+            buf.putShort((short) 0);
+            buf.put(conn.dstAddr);
+            buf.put(conn.srcAddr);
+        }
         buf.putShort((short) conn.dstPort);
         buf.putShort((short) conn.srcPort);
         buf.putInt(seq);
@@ -584,8 +682,12 @@ public class PacketRouter {
         buf.putShort((short) 0);
         buf.putShort((short) 0);
         buf.put(payload);
-        putChecksum(packet, 10, checksum(packet, 0, 20));
-        putChecksum(packet, 36, tcpChecksum(packet, 20, 20 + payload.length, conn.dstAddr, conn.srcAddr));
+        if (!ipv6) {
+            // IPv6 没有头部校验和，只有 TCP 伪首部校验和
+            putChecksum(packet, 10, checksum(packet, 0, IPV4_HEADER_LEN));
+        }
+        putChecksum(packet, ipHeaderLen + 16,
+                tcpChecksum(packet, ipHeaderLen, tcpLen, conn.dstAddr, conn.srcAddr));
         return packet;
     }
 
@@ -657,14 +759,27 @@ public class PacketRouter {
 
     private static int protocolChecksum(byte[] packet, int offset, int len, byte[] srcAddr, byte[] dstAddr,
                                         int protocol) {
-        byte[] pseudo = new byte[12 + len];
-        System.arraycopy(srcAddr, 0, pseudo, 0, 4);
-        System.arraycopy(dstAddr, 0, pseudo, 4, 4);
-        pseudo[8] = 0;
-        pseudo[9] = (byte) protocol;
-        pseudo[10] = (byte) ((len >> 8) & 0xFF);
-        pseudo[11] = (byte) (len & 0xFF);
-        System.arraycopy(packet, offset, pseudo, 12, len);
+        boolean ipv6 = srcAddr.length == IPV6_ADDR_LEN;
+        int pseudoLen = ipv6 ? 40 : 12;
+        byte[] pseudo = new byte[pseudoLen + len];
+        if (ipv6) {
+            // IPv6 伪首部：src(16) + dst(16) + 上层长度(4) + 三字节零(3) + next header(1)
+            System.arraycopy(srcAddr, 0, pseudo, 0, IPV6_ADDR_LEN);
+            System.arraycopy(dstAddr, 0, pseudo, IPV6_ADDR_LEN, IPV6_ADDR_LEN);
+            pseudo[32] = (byte) ((len >> 24) & 0xFF);
+            pseudo[33] = (byte) ((len >> 16) & 0xFF);
+            pseudo[34] = (byte) ((len >> 8) & 0xFF);
+            pseudo[35] = (byte) (len & 0xFF);
+            pseudo[39] = (byte) protocol;   // pseudo[36..38] 保持 0
+        } else {
+            System.arraycopy(srcAddr, 0, pseudo, 0, 4);
+            System.arraycopy(dstAddr, 0, pseudo, 4, 4);
+            pseudo[8] = 0;
+            pseudo[9] = (byte) protocol;
+            pseudo[10] = (byte) ((len >> 8) & 0xFF);
+            pseudo[11] = (byte) (len & 0xFF);
+        }
+        System.arraycopy(packet, offset, pseudo, pseudoLen, len);
         return checksum(pseudo, 0, pseudo.length);
     }
 
@@ -698,9 +813,35 @@ public class PacketRouter {
         return addressToString(srcAddr) + ":" + srcPort + "->" + addressToString(dstAddr) + ":" + dstPort;
     }
 
+    /**
+     * 是否是我们不解析的 IPv6 扩展头（next header 字段里的值）。
+     * 逐跳(0)/路由(43)/分片(44)/AH(51)/目的地选项(60)：出现这些时真正的上层协议在
+     * 更后面的 next header 里，或者我们只拿到一个分片——都按"不支持"丢弃。
+     */
+    private static boolean isIpv6ExtensionHeader(int nextHeader) {
+        return nextHeader == 0 || nextHeader == 43 || nextHeader == 44
+                || nextHeader == 51 || nextHeader == 60;
+    }
+
     private static String addressToString(byte[] addr) {
+        if (addr.length == IPV6_ADDR_LEN) {
+            return formatIpv6(addr);
+        }
         return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
                 + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+    }
+
+    /**
+     * IPv6 文本形式。交给 InetAddress 做 RFC 5952 的 :: 压缩——getByAddress 只解析
+     * 字面量、不发 DNS 查询。同一段字节永远得到同一个字符串，所以连接表 key 稳定。
+     */
+    private static String formatIpv6(byte[] addr) {
+        try {
+            return InetAddress.getByAddress(addr).getHostAddress();
+        } catch (java.net.UnknownHostException e) {
+            // 长度已由调用方保证为 16，理论不可达
+            return "<ipv6:" + addr.length + "B>";
+        }
     }
 
     private static void logTcpIn(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
@@ -737,18 +878,30 @@ public class PacketRouter {
                     long now = System.currentTimeMillis();
                     for (TcpConnection conn : connectionsById.values()) {
                         long age = now - conn.lastActivityTime;
-                        long timeout = conn.state == TcpState.ESTABLISHED
-                                ? ESTABLISHED_IDLE_TIMEOUT_MS : CLOSING_IDLE_TIMEOUT_MS;
-                        if (age > timeout) {
-                            Logger.info(LogConfig.MODULE_VPN, "Stale connection cleanup: connectionId="
-                                    + conn.connectionId + ", state=" + conn.state
-                                    + ", idleMs=" + age);
-                            // 必须走 sendCloseToOutbound：CPP_REMOTE 模式下裸 KcpFrame 会被丢弃，
-                            // 远端会话与 UDP socket 将一直泄漏。
-                            sendCloseToOutbound(conn, conn.sendFrameCallback,
-                                    conn.state != TcpState.ESTABLISHED);
-                            removeConnection(conn);
+                        if (conn.state == TcpState.ESTABLISHED) {
+                            if (age <= ESTABLISHED_IDLE_TIMEOUT_MS) {
+                                continue;
+                            }
+                            // 隧道侧仍有活会话 → 这是"长时间没数据"，不是死连接。
+                            // 远端存活性由 KCP 保活 + dead_link 检测负责（见
+                            // CppRemoteKcpSession 的更新循环），真死时会经 close 回调
+                            // 走 handleRemoteConnectionClosed。旧实现只看空闲时长，
+                            // 把 SSH / IMAP IDLE / 长轮询 / WebSocket 这类长时间静默
+                            // 但完全健康的连接一起掐了。
+                            if (isTunnelAlive(conn)) {
+                                continue;
+                            }
+                        } else if (age <= CLOSING_IDLE_TIMEOUT_MS) {
+                            continue;
                         }
+                        Logger.info(LogConfig.MODULE_VPN, "Stale connection cleanup: connectionId="
+                                + conn.connectionId + ", state=" + conn.state
+                                + ", idleMs=" + age);
+                        // 必须走 sendCloseToOutbound：CPP_REMOTE 模式下裸 KcpFrame 会被丢弃，
+                        // 远端会话与 UDP socket 将一直泄漏。
+                        sendCloseToOutbound(conn, conn.sendFrameCallback,
+                                conn.state != TcpState.ESTABLISHED);
+                        removeConnection(conn);
                     }
                 } catch (InterruptedException e) {
                     break;

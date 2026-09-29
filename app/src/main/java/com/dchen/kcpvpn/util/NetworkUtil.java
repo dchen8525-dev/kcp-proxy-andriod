@@ -34,9 +34,14 @@ public class NetworkUtil {
                 return false;
             }
 
+            // 必须包含 TRANSPORT_VPN：有 VPN 活动时 getActiveNetwork() 返回的就是
+            // 那个 VPN 网络，它的能力位是 TRANSPORT_VPN 而不是底层承载。只认
+            // WIFI/CELLULAR/ETHERNET 会让"本机已有 VPN（本应用的隧道、always-on
+            // VPN 或第三方 VPN）"被误判成"网络不可用"，界面直接拒绝连接。
             return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
                     || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-                    || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET);
+                    || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
         } else {
             NetworkInfo info = manager.getActiveNetworkInfo();
             return info != null && info.isConnected();

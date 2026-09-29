@@ -78,6 +78,9 @@ public class CppRemoteKcpSession {
     private volatile boolean socks5Done;
     private volatile boolean finEnabled;
     private volatile boolean localFinSent;
+    // 握手完成前就收到本地 FIN 时先记下来，等排队数据发完再发（见 sendLocalFin）。
+    // 只在 pendingLock 下访问。
+    private boolean localFinPending;
     private volatile boolean peerFinReceived;
     private int authFailures;
     private int pendingBytes;
@@ -152,8 +155,17 @@ public class CppRemoteKcpSession {
                     + connectionId);
             return;
         }
-        if (!socks5Done) {
-            synchronized (pendingLock) {
+        synchronized (pendingLock) {
+            // socks5Done 的判定必须和"排队/直接发"这个动作原子：handleSocks5Response
+            // 会在置位后立刻排空队列。若在锁外读 socks5Done，本线程可能在
+            // "已置位、但排队数据还没写进 KCP"的窗口里拿到 true，于是直接 sendRaw，
+            // 既插到了排队数据前面（乱序），也可能让排队数据永远发不出去。
+            if (localFinSent) {
+                Logger.warning(LogConfig.MODULE_VPN, "CPP_REMOTE ignoring payload after local FIN connectionId="
+                        + connectionId);
+                return;
+            }
+            if (!socks5Done) {
                 if (pendingBytes + data.length > PENDING_LIMIT_BYTES) {
                     Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE pending data overflow connectionId="
                             + connectionId);
@@ -163,10 +175,10 @@ public class CppRemoteKcpSession {
                 byte[] copy = data.clone();
                 pendingClientData.add(copy);
                 pendingBytes += copy.length;
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE queued TCP payload before SOCKS5 connectionId="
+                        + connectionId + " len=" + data.length);
+                return;
             }
-            Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE queued TCP payload before SOCKS5 connectionId="
-                    + connectionId + " len=" + data.length);
-            return;
         }
         Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE TCP payload -> KCP raw len=" + data.length
                 + " connectionId=" + connectionId);
@@ -182,15 +194,32 @@ public class CppRemoteKcpSession {
         if (!running || closed.get()) {
             return;
         }
+        boolean defer;
+        synchronized (pendingLock) {
+            if (localFinSent) {
+                return;
+            }
+            // 握手还没完成：排队数据尚未写进 KCP，此刻发 FIN 会让服务端先看到
+            // FIN 再把请求字节当作"FIN 之后的数据"，请求丢失或被拒。
+            // 先记下来，等 handleSocks5Response 排空队列之后再发。
+            defer = !socks5Done;
+            if (defer) {
+                if (localFinPending) {
+                    return;
+                }
+                localFinPending = true;
+                Logger.info(LogConfig.MODULE_VPN,
+                        "CPP_REMOTE FIN deferred until handshake completes connectionId=" + connectionId);
+                return;
+            }
+            localFinSent = true;
+        }
+        Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE FIN sent (half-close) connectionId=" + connectionId);
         if (!finEnabled) {
+            // 老服务端不支持半关闭，且此时排队数据已发完，直接拆除。
             close("tcp_fin");
             return;
         }
-        if (localFinSent) {
-            return;
-        }
-        localFinSent = true;
-        Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE FIN sent (half-close) connectionId=" + connectionId);
         sendRaw(controlPayload(CryptoConfig.CONTROL_FIN, crypto.sessionSalt()));
         lastHalfCloseProgressMs.set(System.currentTimeMillis());
         if (peerFinReceived) {
@@ -204,9 +233,21 @@ public class CppRemoteKcpSession {
                 return;
             }
             try {
+                boolean alive;
                 synchronized (kcpLock) {
                     kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
                     kcp.flush();
+                    alive = kcp.isAlive();
+                }
+                if (!alive) {
+                    // KCP 死链（某段重传超过 dead_link 次，state=-1）。必须在这里
+                    // 主动回收：空闲连接两边都没有数据，dead_link 靠 maybeSendKeepalive
+                    // 的 30s 保活才会触发；不检测的话会话会一直挂着，PacketRouter 的连接
+                    // 映射也跟着泄漏——这正是过去用"空闲 3 分钟就掐"粗暴兜底的根因。
+                    Logger.warning(LogConfig.MODULE_VPN, "CPP_REMOTE KCP dead link connectionId="
+                            + connectionId);
+                    close("KCP_SESSION_FAILED");
+                    return;
                 }
                 drainOutboundQueue();
                 pollUdpPackets();
@@ -399,9 +440,10 @@ public class CppRemoteKcpSession {
     }
 
     private void sendSocks5Connect() {
-        byte[] request = CppSocks5RequestBuilder.buildIpv4Connect(dstAddr, dstPort);
+        byte[] request = CppSocks5RequestBuilder.buildConnect(dstAddr, dstPort);
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE SOCKS5 CONNECT connectionId=" + connectionId
-                + " dst=" + addrToString(dstAddr) + ":" + dstPort);
+                + " dst=" + addrToString(dstAddr) + ":" + dstPort
+                + " atyp=" + (dstAddr.length == 16 ? "IPV6" : "IPV4"));
         sendRaw(request);
     }
 
@@ -457,30 +499,82 @@ public class CppRemoteKcpSession {
             close("SOCKS5_CONNECT_FAILED");
             return;
         }
-        socks5Done = true;
+        boolean deferredFin;
+        synchronized (pendingLock) {
+            // 置位、排空、被推迟的 FIN 必须在同一个临界区里完成，见 sendTcpPayload。
+            socks5Done = true;
+            flushPendingClientData();
+            deferredFin = localFinPending && !localFinSent;
+            if (deferredFin) {
+                localFinSent = true;
+            }
+        }
         cancelSocks5ResponseTimeout();
         remoteStateCallback.onRemoteReachable();
-        flushPendingClientData();
+        if (deferredFin) {
+            sendDeferredFin();
+        }
         byte[] extra = socks5ResponseBuffer.extraPayload();
         if (extra.length > 0) {
             dataCallback.onData(extra);
         }
     }
 
+    /** 握手期间被推迟的本地 FIN：排队数据已经发完，此刻发出才保序。 */
+    private void sendDeferredFin() {
+        if (!finEnabled) {
+            // 老服务端不支持半关闭，直接拆除（排队数据已在临界区内发完）。
+            Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE deferred FIN -> immediate close (V1 server) "
+                    + "connectionId=" + connectionId);
+            close("tcp_fin");
+            return;
+        }
+        Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE FIN sent (half-close, deferred) connectionId="
+                + connectionId);
+        sendRaw(controlPayload(CryptoConfig.CONTROL_FIN, crypto.sessionSalt()));
+        lastHalfCloseProgressMs.set(System.currentTimeMillis());
+        if (peerFinReceived) {
+            close("tcp_fin");
+        }
+    }
+
+    /**
+     * 把握手前排队的数据按 FWD_BUF_SIZE 切块写入 KCP。
+     * 调用方必须持有 pendingLock（本方法内部会重新获取，锁可重入）：socks5Done
+     * 的置位与这次排空是一个原子步骤，中间不能插入任何直接写 KCP 的路径。
+     */
     private void flushPendingClientData() {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
         synchronized (pendingLock) {
+            if (pendingClientData.isEmpty()) {
+                return;
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
             while (!pendingClientData.isEmpty()) {
                 byte[] data = pendingClientData.remove();
                 out.write(data, 0, data.length);
             }
             pendingBytes = 0;
-        }
-        byte[] data = out.toByteArray();
-        if (data.length > 0) {
-            Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE flush queued TCP payload len=" + data.length
-                    + " connectionId=" + connectionId);
-            sendRaw(data);
+            // 绝不把整个待发队列拼成一条 KCP 消息。C++ 服务端的接收缓冲是
+            // FWD_BUF_SIZE，超出的消息会让它 complete_pending_read(message_size)，
+            // forward_kcp_to_tcp 随即 close_connection —— 一个在 SOCKS5 应答到达前
+            // 就写出 >16KB 的应用（典型的 HTTP POST/上传，PacketRouter 会本地合成
+            // SYN-ACK 并立即 ACK，所以应用不会等）会把整条会话拆掉。
+            // 按 FWD_BUF_SIZE 切块：每块都是一条合法消息，且顺序不变（sendRaw 一旦
+            // 开始排队就全部按 FIFO 走）。
+            byte[] all = out.toByteArray();
+            for (int off = 0; off < all.length; off += SessionConfig.FWD_BUF_SIZE) {
+                int len = Math.min(SessionConfig.FWD_BUF_SIZE, all.length - off);
+                byte[] chunk;
+                if (off == 0 && len == all.length) {
+                    chunk = all;  // 常见情况（总量不超限）：不额外拷贝
+                } else {
+                    chunk = new byte[len];
+                    System.arraycopy(all, off, chunk, 0, len);
+                }
+                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE flush queued TCP payload len=" + len
+                        + " connectionId=" + connectionId);
+                sendRaw(chunk);
+            }
         }
     }
 
@@ -520,19 +614,21 @@ public class CppRemoteKcpSession {
 
     /**
      * 更新线程把排队的出站字节按序补进 KCP，直到重新触及阈值。
-     * 在 kcpLock 之外调用，避免与 VPN 读线程长时间争锁。
+     * 取出元素后必须**仍在 outboundLock 内**写 KCP：若先释放锁再写，并发的
+     * sendRaw 会看到队列已空且有余量，直接写 KCP 抢到 next 前面，打乱字节流
+     * 顺序（KCP 的发送顺序即流顺序）。锁序 outboundLock → kcpLock 与 sendRaw
+     * 一致，不会成环。
      */
     private void drainOutboundQueue() {
         while (running) {
-            byte[] next;
             synchronized (outboundLock) {
                 if (outboundQueue.isEmpty() || !hasSendCapacity(waitSend())) {
                     return;
                 }
-                next = outboundQueue.remove();
+                byte[] next = outboundQueue.remove();
                 outboundBytes -= next.length;
+                writeThroughKcp(next);
             }
-            writeThroughKcp(next);
         }
     }
 
@@ -607,11 +703,23 @@ public class CppRemoteKcpSession {
         closeCallback.onClosed(reason);
     }
 
+    /**
+     * 关闭原因是"正常结束"还是"异常失败"。用显式白名单，而不是在 reason 里找
+     * "FAILED" 子串——失败原因里 SESSION_TIMEOUT、CPP_SERVER_NO_RESPONSE、
+     * CRYPTO_MISMATCH、KCP_BACKPRESSURE_OVERFLOW 都不含 "FAILED"，按子串判断会把
+     * 它们当成正常关闭，向应用回 FIN。应用会看到干净的 EOF，无从察觉响应被截断
+     * （对 HTTP POST / IMAP 这类非幂等协议尤其有害）。
+     * 本方法是关闭原因语义的唯一判定源，PacketRouter 的 FIN/RST 选择也用它。
+     */
+    public static boolean isGracefulCloseReason(String reason) {
+        return "tcp_fin".equals(reason)
+                || "tcp_rst".equals(reason)
+                || "manager_stop".equals(reason)
+                || "duplicate_connection".equals(reason);
+    }
+
     private static boolean isRemoteFailure(String reason) {
-        return reason != null
-                && !"manager_stop".equals(reason)
-                && !"tcp_rst".equals(reason)
-                && !"tcp_fin".equals(reason);
+        return reason != null && !isGracefulCloseReason(reason);
     }
 
     private void cancelSocks5ResponseTimeout() {
@@ -630,6 +738,15 @@ public class CppRemoteKcpSession {
     }
 
     private static String addrToString(byte[] addr) {
+        if (addr.length == 16) {
+            // 只用于日志：交给 InetAddress 做 RFC 5952 压缩（getByAddress 只解析
+            // 字面量，不发 DNS 查询）。旧写法会把 IPv6 地址的前 4 字节当成 IPv4 打出来。
+            try {
+                return java.net.InetAddress.getByAddress(addr).getHostAddress();
+            } catch (java.net.UnknownHostException e) {
+                return "<ipv6:" + addr.length + "B>";
+            }
+        }
         return (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "."
                 + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
     }

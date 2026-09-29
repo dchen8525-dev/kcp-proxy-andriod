@@ -37,18 +37,23 @@ import java.util.concurrent.atomic.AtomicLong;
 public class KcpVpnService extends VpnService {
     public static final String ACTION_STOP = "com.dchen.kcpvpn.action.STOP_VPN";
 
-    private ParcelFileDescriptor vpnInterface;
-    private FileInputStream vpnInputStream;
-    private FileOutputStream vpnOutputStream;
-    private FileChannel vpnInputChannel;
-    private FileChannel vpnOutputChannel;
+    // 这些字段被 VPN-Read / Health-Check 线程读取，同时被 closeVpn() 置 null。
+    // volatile 保证置 null 对其他线程立即可见，读线程再用局部变量取一次快照，
+    // 避免"判空通过后又变成 null"的 TOCTOU。
+    private volatile ParcelFileDescriptor vpnInterface;
+    private volatile FileInputStream vpnInputStream;
+    private volatile FileOutputStream vpnOutputStream;
+    private volatile FileChannel vpnInputChannel;
+    private volatile FileChannel vpnOutputChannel;
 
-    private TunnelManager tunnelManager;
-    private CppRemoteTunnelManager cppRemoteTunnelManager;
-    private PacketRouter packetRouter;
+    private volatile TunnelManager tunnelManager;
+    private volatile CppRemoteTunnelManager cppRemoteTunnelManager;
+    private volatile PacketRouter packetRouter;
 
     private Thread vpnReadThread;
     private Thread healthCheckThread;
+    // closeVpn 可被 onDestroy / onRevoke / stopVpn 三处并发调用，用它保证只真正执行一次。
+    private boolean vpnClosed;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile VpnConnectionState connectionState;
@@ -64,6 +69,11 @@ public class KcpVpnService extends VpnService {
     private static final String KEY_SERVER_PORT = "server_port";
     private static final String KEY_KEY = "key";
     private static final String KEY_LOCAL_MODE = "local_mode";
+
+    // tun 写不进去时最多退让重试的次数（每次 1ms）。establish() 返回的 fd 是非阻塞
+    // 的，队列满时 write 返回 0；此时直接丢弃等于让一个 TCP 段无声消失（tun 之上
+    // 没有重传，对端连接会一直挂到超时），所以短暂退让等队列排空，仍失败才上报。
+    private static final int VPN_WRITE_MAX_STALLS = 10;
 
     // 流量统计 — AtomicLong 保证原子性
     private final AtomicLong uploadBytes = new AtomicLong(0);
@@ -243,6 +253,11 @@ public class KcpVpnService extends VpnService {
     private void startVpn() {
         Logger.info(LogConfig.MODULE_VPN, "startVpn() begin");
 
+        // 同一实例可能被 onStartCommand 多次拉起，重置 closeVpn 的一次性标志。
+        synchronized (this) {
+            vpnClosed = false;
+        }
+
         connectionState = VpnConnectionState.CONNECTING;
         broadcastState();
         updateNotification();
@@ -252,14 +267,20 @@ public class KcpVpnService extends VpnService {
 
             // 建立 VPN 接口
             Builder builder = new Builder();
+            // IPv6 也要收进隧道：不通告 ::/0 的话，双栈网络下应用会绕过隧道直连
+            // IPv6 目标（既泄漏真实出口，又让"是否走代理"随地址族而变）。
+            // PacketRouter 对 IPv6 只转发 TCP；UDP（QUIC 等）与 IPv4 上的非 DNS UDP
+            // 一样丢弃，DNS 仍走下面通告的 IPv4 解析器。
             builder.setSession(VpnConfig.VPN_SESSION_NAME)
                     .setMtu(VpnConfig.VPN_MTU)
                     .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
+                    .addAddress(VpnConfig.VPN_ADDRESS_IPV6, VpnConfig.VPN_ADDRESS_PREFIX_IPV6)
                     .addRoute("0.0.0.0", 0)
+                    .addRoute("::", 0)
                     .addDnsServer("1.1.1.1")
                     .addDnsServer("8.8.8.8")
                     .addDisallowedApplication(getPackageName());
-            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 dns=1.1.1.1,8.8.8.8 excludedApp="
+            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0,::/0 dns=1.1.1.1,8.8.8.8 excludedApp="
                     + getPackageName() + " chromeExcluded=false");
 
             vpnInterface = builder.establish();
@@ -366,6 +387,10 @@ public class KcpVpnService extends VpnService {
             packetRouter.setSocketProtector(protector);
             packetRouter.setLocalMode(localMode);
             packetRouter.setCppRemoteTunnelManager(cppRemoteTunnelManager);
+            if (tunnelManager != null) {
+                // 本地模式的隧道存活判据：空闲回收不再单纯按"多久没数据"掐连接。
+                packetRouter.setTunnelAliveSupplier(tunnelManager::isConnected);
+            }
             packetRouter.start();
 
             if (localMode) {
@@ -405,6 +430,10 @@ public class KcpVpnService extends VpnService {
             startHealthCheckThread();
 
             connectionStartTime = System.currentTimeMillis();
+            // 上面那次 updateNotification() 发生在 connectionStartTime 赋值之前，
+            // 且当时状态还是 CONNECTING。成功路径上必须再刷一次，否则通知栏会一直
+            // 停在"连接中"（旧实现只在 catch 分支里又调了一次）。
+            updateNotification();
 
             // 不重复设 CONNECTED，tunnelManager 的回调已经设过了
             Logger.info(LogConfig.MODULE_VPN, "LOCAL_VPN_STARTED VPN started successfully");
@@ -426,10 +455,18 @@ public class KcpVpnService extends VpnService {
         vpnReadThread = new Thread(() -> {
             ByteBuffer buffer = ByteBuffer.allocate(VpnConfig.VPN_MTU + 28);
 
-            while (running.get() && vpnInputChannel != null) {
+            while (running.get()) {
                 try {
+                    // 取一次快照：closeVpn 会在另一个线程把这些字段置 null，
+                    // 直接读字段会出现"判空通过、调用时已是 null"的 NPE。
+                    FileChannel in = vpnInputChannel;
+                    PacketRouter router = packetRouter;
+                    if (in == null || router == null) {
+                        break;
+                    }
+
                     buffer.clear();
-                    int len = vpnInputChannel.read(buffer);
+                    int len = in.read(buffer);
 
                     if (len > 0) {
                         buffer.flip();
@@ -438,7 +475,7 @@ public class KcpVpnService extends VpnService {
                         Logger.debug(LogConfig.MODULE_VPN, "TUN IN len=" + len);
 
                         // 处理出站数据包
-                        packetRouter.handleOutboundPacket(packet,
+                        router.handleOutboundPacket(packet,
                                 new PacketRouter.OutboundCallback() {
                                     @Override
                                     public void onSendFrame(com.dchen.kcpvpn.core.protocol.KcpFrame frame) {
@@ -464,8 +501,18 @@ public class KcpVpnService extends VpnService {
                                 });
 
                         Logger.debug(LogConfig.MODULE_VPN, "VPN read: " + len + " bytes");
+                    } else if (len == 0) {
+                        // establish() 返回的 fd 默认是非阻塞的（见 Builder.setBlocking 的
+                        // 文档），没有数据可读时会立刻返回 0 而不是阻塞。原实现没有这个
+                        // 分支，所以 VPN 一起来这个线程就 100% 占满一个核（耗电/发热）。
+                        // 这里退让 1ms 把空转压成 1kHz 轮询；若该 fd 实际是阻塞的，
+                        // len==0 根本不会发生，此分支不生效，行为与原来一致。
+                        Thread.sleep(1);
                     }
 
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
                 } catch (IOException e) {
                     if (running.get()) {
                         Logger.error(LogConfig.MODULE_VPN, "VPN read error: " + e.getMessage());
@@ -485,8 +532,9 @@ public class KcpVpnService extends VpnService {
             while (running.get()) {
                 try {
                     Thread.sleep(5000);
-                    if (tunnelManager != null) {
-                        tunnelManager.checkConnection();
+                    TunnelManager tm = tunnelManager;
+                    if (tm != null) {
+                        tm.checkConnection();
                     }
                 } catch (InterruptedException e) {
                     break;
@@ -500,11 +548,12 @@ public class KcpVpnService extends VpnService {
      * 处理入站数据
      */
     private void handleInboundFrame(com.dchen.kcpvpn.core.protocol.KcpFrame frame) {
-        if (!running.get() || vpnOutputChannel == null) {
+        PacketRouter router = packetRouter;
+        if (!running.get() || vpnOutputChannel == null || router == null) {
             return;
         }
 
-        packetRouter.handleInboundFrame(frame,
+        router.handleInboundFrame(frame,
                 new PacketRouter.WritePacketCallback() {
                     @Override
                     public void onWritePacket(byte[] packet) {
@@ -521,33 +570,69 @@ public class KcpVpnService extends VpnService {
     }
 
     private synchronized void writeToVpn(byte[] packet) throws IOException {
+        // closeVpn 与本方法同锁，但调用方判空之后、进入本方法之前仍可能已被关闭。
+        FileChannel out = vpnOutputChannel;
+        if (out == null) {
+            throw new IOException("VPN interface already closed");
+        }
         ByteBuffer buffer = ByteBuffer.wrap(packet);
-        vpnOutputChannel.write(buffer);
+        int stalls = 0;
+        while (buffer.hasRemaining()) {
+            int written = out.write(buffer);
+            if (written > 0) {
+                stalls = 0;
+                continue;
+            }
+            // write 返回 0：fd 是非阻塞的且 tun 队列已满。丢包会让上层 TCP 无感地
+            // 少一个段，所以这里退让后重试，而不是当作成功直接返回。
+            if (++stalls > VPN_WRITE_MAX_STALLS) {
+                throw new IOException("VPN write stalled: " + buffer.remaining()
+                        + " of " + packet.length + " bytes undelivered after "
+                        + VPN_WRITE_MAX_STALLS + " retries");
+            }
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("VPN write interrupted");
+            }
+        }
         Logger.debug(LogConfig.MODULE_VPN, "VPN WRITE len=" + packet.length);
     }
 
     /**
-     * 关闭 VPN
+     * 关闭 VPN。
+     * synchronized 是必需的：onDestroy / onRevoke / stopVpn 三条路径都会调用，
+     * 且 writeToVpn 也锁 this。没有它，两个 closeVpn 会交错地把字段置 null 两次，
+     * 并可能在 writeToVpn 用 vpnOutputChannel 的过程中把它清掉（NPE）。
      */
-    private void closeVpn() {
+    private synchronized void closeVpn() {
+        if (vpnClosed) {
+            return;
+        }
+        vpnClosed = true;
+
         running.set(false);
 
         Logger.info(LogConfig.MODULE_VPN, "Closing VPN...");
 
         // 停止隧道
-        if (tunnelManager != null) {
-            tunnelManager.disconnect();
-            tunnelManager = null;
+        TunnelManager tm = tunnelManager;
+        tunnelManager = null;
+        if (tm != null) {
+            tm.disconnect();
         }
-        if (cppRemoteTunnelManager != null) {
-            cppRemoteTunnelManager.stop();
-            cppRemoteTunnelManager = null;
+        CppRemoteTunnelManager ctm = cppRemoteTunnelManager;
+        cppRemoteTunnelManager = null;
+        if (ctm != null) {
+            ctm.stop();
         }
 
         // 停止路由器
-        if (packetRouter != null) {
-            packetRouter.stop();
-            packetRouter = null;
+        PacketRouter pr = packetRouter;
+        packetRouter = null;
+        if (pr != null) {
+            pr.stop();
         }
 
         // 先关闭 VPN 接口，解除 vpnReadThread 的阻塞读
@@ -592,6 +677,9 @@ public class KcpVpnService extends VpnService {
         vpnInputChannel = null;
         vpnOutputChannel = null;
         vpnInterface = null;
+
+        // 释放 LocalKcpServer 里那个捕获了本 Service 的静态 SocketProtector
+        LocalKcpServer.clearSocketProtector();
 
         // 清除保存的参数
         clearSavedParams();

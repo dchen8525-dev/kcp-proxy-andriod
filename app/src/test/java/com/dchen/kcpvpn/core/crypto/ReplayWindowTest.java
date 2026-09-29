@@ -91,4 +91,40 @@ public class ReplayWindowTest {
     public void windowSizeMatchesCppConstant() {
         assertEquals(2048, CryptoConfig.REPLAY_WINDOW_BITS);
     }
+
+    @Test
+    public void countersWithHighBitSetAreComparedUnsigned() {
+        // counter 直接取自报文 nonce 的 8 字节大端字段，任意 64 位值都可能出现
+        // （C++ 侧类型是 uint64_t），所以比较必须按无符号语义。
+        ReplayWindow window = new ReplayWindow();
+        window.commit(1);
+        // 无符号 2^63 大于 1，应视为更新的计数器而接受，而不是当成负数/过期值
+        assertTrue(window.check(Long.MIN_VALUE));
+        window.commit(Long.MIN_VALUE);
+        assertEquals(Long.MIN_VALUE, window.getHighestReceived());
+        // 1 此时落后 2^63-1，远超窗口
+        assertFalse(window.check(1));
+    }
+
+    @Test
+    public void farBehindUnsignedCounterIsRejected() {
+        ReplayWindow window = new ReplayWindow();
+        window.commit(Long.MIN_VALUE);              // 无符号 2^63
+        assertFalse(window.check(0));               // 落后 2^63，窗口外
+        assertTrue(window.check(Long.MAX_VALUE));   // 落后 1，窗口内且未记录
+    }
+
+    @Test
+    public void largeUnsignedGapDoesNotProduceNegativeBitIndex() {
+        // 回归：最高值 2^62、counter 无符号 2^64-2^62 时，有符号减法
+        // highest-counter 溢出成 Long.MIN_VALUE，通过 offset > WINDOW_BITS 判断，
+        // 而 (int)(offset-1) == -1，BitSet.get(-1) 抛 IndexOutOfBoundsException。
+        // 无符号比较下 counter 更大，直接放行。
+        ReplayWindow window = new ReplayWindow();
+        window.commit(1L << 62);
+        long counter = -(1L << 62);                 // 无符号 2^64 - 2^62
+        assertTrue(window.check(counter));
+        window.commit(counter);
+        assertEquals(counter, window.getHighestReceived());
+    }
 }

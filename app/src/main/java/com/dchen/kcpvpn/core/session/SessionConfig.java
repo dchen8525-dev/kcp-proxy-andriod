@@ -15,7 +15,11 @@ public class SessionConfig {
 
     // 缓冲区大小
     public static final int UDP_RECV_BUF_SIZE = 65536;
-    public static final int FWD_BUF_SIZE = 4096;
+    // 单条 KCP 消息的上限。必须与 C++ config.hpp 的 FWD_BUF_SIZE 相等：对端用它
+    // 作为接收缓冲（kcp_tunnel.hpp 的 kcp_recv_buf_），收到更大的消息会走
+    // complete_pending_read(message_size)，服务端 forward_kcp_to_tcp 把它当致命
+    // 错误并 close_connection。这个值同时决定 KcpConfig 的段数与背压阈值。
+    public static final int FWD_BUF_SIZE = 16384;
     public static final int SOCKS5_REPLY_BUF_SIZE = 512;
 
     // UDP 内核缓冲（与 C++ UDP_SO_RCVBUF/SNDBUF 一致）：内核缓冲不足时突发丢包

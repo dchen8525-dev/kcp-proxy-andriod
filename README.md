@@ -10,7 +10,7 @@ Android 11+ (API 30) 全局 KCP 隧道 VPN 应用。基于原生 VpnService 实�
   - 本地自测模式：使用内部/本地实现（`127.0.0.1:8443`），本机闭环测试
 
 - **协议兼容**
-  - CPP_REMOTE 使用 SOCKS5-over-KCP raw stream，首个 KCP payload 是 SOCKS5 CONNECT，后续 payload 是 TCP 字节流
+  - CPP_REMOTE 使用 SOCKS5-over-KCP raw stream，首个 KCP payload 是 `KCP_PROXY_HELLO_V2`，握手完成后才是 SOCKS5 CONNECT 与后续 TCP 字节流
   - KCP 参数与 C++ 版本一致（MTU=1400, SNDWND=256, RCVWND=512）
   - HKDF-SHA256 per-session 密钥派生 + AES-128-GCM 加密 + 2048-bit 重放防护（V2 线格式，与 C++ 端逐字节一致）
   - V2 握手 `KCP_PROXY_HELLO_V2` / `KCP_PROXY_HELLO_ACK_V2`，支持 keepalive 与 FIN 半关闭（本地 FIN 后等待服务端排空在途数据）
@@ -74,7 +74,7 @@ export ANDROID_HOME=/path/to/Android/Sdk
 ```
 app/src/main/java/com/dchen/kcpvpn/
 ├── core/                  # 核心层（纯 Java，无 Android 依赖）
-│   ├── kcp/               # KCP 协议实现（Kcp.java ~1600行，从 C ikcp.c 移植）
+│   ├── kcp/               # KCP 协议实现（Kcp.java ~840行，从 C ikcp.c 移植）
 │   ├── crypto/            # 加密（HKDF + AES-GCM + Nonce + 重放保护）
 │   ├── protocol/          # SOCKS5 协议编解码 + 地址解析
 │   └── session/           # KcpClientSession 客户端会话管理

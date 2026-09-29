@@ -23,19 +23,27 @@ public class ReplayWindow {
 
     /**
      * 纯读检查：counter 是否可接受（未重放、未过期）。不修改任何状态。
+     *
+     * <p>所有比较都是<b>无符号</b>的：counter 直接来自报文 nonce 的 8 字节大端字段，
+     * 对端（以及任何攻击者）可以填任意 64 位值，而 C++ 侧的类型是 uint64_t。
+     * 用 Java 的有符号 {@code >} 比较，形如 counter = Long.MIN_VALUE 的包会绕过
+     * {@code offset > WINDOW_BITS} 判断（减法溢出成负数），随后 {@code (int)(offset-1)}
+     * 可能是负数，BitSet.get 会抛 IndexOutOfBoundsException。
      */
     public synchronized boolean check(long counter) {
         if (!anyReceived) {
             return true;
         }
-        if (counter > highestReceived) {
+        if (Long.compareUnsigned(counter, highestReceived) > 0) {
             return true;
         }
         if (counter == highestReceived) {
             return false;
         }
+        // 走到这里说明 counter < highestReceived（无符号），差值恒在 [1, 2^64-1]，
+        // 不会溢出；再按无符号判定是否落在窗口外。
         long offset = highestReceived - counter;
-        if (offset > WINDOW_BITS) {
+        if (Long.compareUnsigned(offset, WINDOW_BITS) > 0) {
             return false;
         }
         return !window.get((int) (offset - 1));
@@ -52,9 +60,9 @@ public class ReplayWindow {
             window.clear();
             return;
         }
-        if (counter > highestReceived) {
+        if (Long.compareUnsigned(counter, highestReceived) > 0) {
             long shift = counter - highestReceived;
-            if (shift > WINDOW_BITS) {
+            if (Long.compareUnsigned(shift, WINDOW_BITS) > 0) {
                 window.clear();
             } else {
                 slideLeft((int) shift);
@@ -63,9 +71,9 @@ public class ReplayWindow {
             highestReceived = counter;
             return;
         }
-        if (counter < highestReceived) {
+        if (counter != highestReceived) {
             long offset = highestReceived - counter;
-            if (offset <= WINDOW_BITS) {
+            if (Long.compareUnsigned(offset, WINDOW_BITS) <= 0) {
                 window.set((int) (offset - 1));
             }
         }
