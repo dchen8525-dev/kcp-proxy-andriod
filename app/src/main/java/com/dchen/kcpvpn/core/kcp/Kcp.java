@@ -182,11 +182,12 @@ public class Kcp {
             return -1;
         }
 
-        // 计算分片数量（限制不超过接收窗口）
+        // 计算分片数量。frg 在线上只有 1 字节，count-1 必须落进 [0,254]；
+        // 旧写法用 rcv_wnd(512) 当上限，count ∈ [255,512] 的消息会以截断的
+        // frg 编码上线，对端重组错乱（与 ikcp.c 的 count >= 255 检查一致）。
         int count = (len + mss - 1) / mss;
         if (count == 0) count = 1;
-        if (count > this.rcv_wnd) {
-            // 超过远端接收窗口，丢弃
+        if (count >= 255) {
             return -2;
         }
 

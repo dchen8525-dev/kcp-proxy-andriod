@@ -49,7 +49,8 @@ public class PacketRouterHalfCloseTest {
         sendTcp(0x11, SYN_SEQ + 4, serverNextSeq(), new byte[0]);
         assertEquals("本地 FIN 之后只能回 ACK，FIN 必须延后", 0x10, flags(lastWritten()));
         assertEquals(SYN_SEQ + 5, ackNumber(lastWritten()));
-        assertEquals(1, countFrames(KcpFrame.TYPE_CLOSE));
+        assertEquals("半关闭走 TYPE_FIN（服务器端 shutdownOutput 保留目标响应）",
+                1, countFrames(KcpFrame.TYPE_FIN));
         assertEquals("半关闭前不得发出 FIN", 0, countWrittenFlags(0x11));
 
         written.clear();
@@ -74,8 +75,29 @@ public class PacketRouterHalfCloseTest {
         sendTcp(0x11, SYN_SEQ + 4, serverNextSeq(), new byte[0]);
         sendTcp(0x11, SYN_SEQ + 4, serverNextSeq(), new byte[0]);
 
-        assertEquals(1, countFrames(KcpFrame.TYPE_CLOSE));
+        assertEquals(1, countFrames(KcpFrame.TYPE_FIN));
         assertEquals(0x10, flags(lastWritten()));
+    }
+
+    @Test
+    public void serverFinWritesAppFinAndKeepsConnectionUntilAppFin() {
+        establish();
+        int expectedServerNextSeq = serverNextSeq();
+        written.clear();
+
+        // 远端先 FIN：应用收到 FIN（0x11），连接保留等待应用方向收尾
+        router.handleInboundFrame(new KcpFrame(KcpFrame.TYPE_FIN, connectionId, null), writer());
+        assertEquals(1, written.size());
+        assertEquals("远端 FIN 必须以 FIN|ACK 写给应用", 0x11, flags(written.get(0)));
+
+        // 应用随后 FIN：回 ACK 并把 FIN 转告远端，双方都完成后整体拆除
+        sendTcp(0x11, SYN_SEQ + 4, expectedServerNextSeq, new byte[0]);
+        assertEquals(1, countFrames(KcpFrame.TYPE_FIN));
+
+        written.clear();
+        router.handleInboundFrame(new KcpFrame(KcpFrame.TYPE_DATA, connectionId,
+                "late".getBytes(StandardCharsets.US_ASCII)), writer());
+        assertTrue("双方 FIN 完成后连接已回收", written.isEmpty());
     }
 
     private void establish() {

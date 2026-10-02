@@ -20,6 +20,7 @@ import com.dchen.kcpvpn.log.LogConfig;
 import com.dchen.kcpvpn.log.Logger;
 import com.dchen.kcpvpn.server.LocalKcpServer;
 import com.dchen.kcpvpn.ui.MainActivity;
+import com.dchen.kcpvpn.util.SecretPrefs;
 import com.dchen.kcpvpn.vpn.cppremote.CppRemoteTunnelManager;
 
 import java.io.FileInputStream;
@@ -762,34 +763,45 @@ public class KcpVpnService extends VpnService {
     }
 
     /**
-     * 保存参数到 SharedPreferences
+     * 保存参数到 SharedPreferences。
+     * PSK 经 SecretPrefs 用 Keystore 包裹后落盘（明文不进 prefs 文件）；
+     * 其余非敏感参数明文存储。保存只服务于 START_STICKY 重启恢复。
      */
     private void saveParams() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SecretPrefs.save(prefs, key);
         prefs.edit()
                 .putString(KEY_SERVER_HOST, serverHost)
                 .putInt(KEY_SERVER_PORT, serverPort)
-                .putString(KEY_KEY, key)
                 .putBoolean(KEY_LOCAL_MODE, localMode)
                 .apply();
     }
 
     /**
-     * 从 SharedPreferences 恢复参数
+     * 从 SharedPreferences 恢复参数。PSK 优先读 SecretPrefs 加密条目；旧版本
+     * 升级上来的安装可能还有明文 "key" 条目——读到后立即转存为加密形式。
      */
     private void restoreParams() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         serverHost = prefs.getString(KEY_SERVER_HOST, null);
         serverPort = prefs.getInt(KEY_SERVER_PORT, 0);
-        key = prefs.getString(KEY_KEY, null);
+        key = SecretPrefs.load(prefs);
+        if (key == null) {
+            String legacyPlain = prefs.getString(KEY_KEY, null);
+            if (legacyPlain != null) {
+                key = legacyPlain;
+                SecretPrefs.save(prefs, legacyPlain);
+            }
+        }
         localMode = prefs.getBoolean(KEY_LOCAL_MODE, false);
     }
 
     /**
-     * 清除保存的参数
+     * 清除保存的参数（含 SecretPrefs 的密文与旧版明文条目）。
      */
     private void clearSavedParams() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SecretPrefs.clear(prefs);
         prefs.edit().clear().apply();
         serverHost = null;
         serverPort = 0;

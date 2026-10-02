@@ -67,6 +67,16 @@ public class LocalKcpServer {
     private final Map<String, UdpRelay> udpRelays;
     private final ServerConnectionManager connectionManager;
     private final ThreadPoolExecutor dnsExecutor;
+    // 认证节流（与 C++ get_or_create_session 的两级节流同参数、同语义）：
+    // 每地址失败表——反复认证失败的来源直接丢弃，不再支付 HKDF+AEAD 的 CPU；
+    // 全局尝试预算——限制分散来源的洪水的总解密开销。只在 recvThread 上访问。
+    private final Map<String, Integer> authFailuresByAddr = new java.util.HashMap<>();
+    private long authWindowStartMs;
+    private int authAttemptsInWindow;
+    // salt 墓碑：会话接受后的 salt 在 TTL 内拒绝重建——死会话的首包重放会通过
+    // AEAD（同 salt 同密钥）并以重放的 CONNECT 建新会话，没有墓碑就无法拦截。
+    // recv 线程写入、cleanup 线程清扫，必须用并发容器。
+    private final Map<String, Long> saltTombstones = new java.util.concurrent.ConcurrentHashMap<>();
 
     private Thread recvThread;
     private Thread cleanupThread;
@@ -160,8 +170,12 @@ public class LocalKcpServer {
             // 先按新会话认证，认证通过才整体替换；直接丢弃异 salt 的伪造包，
             // 否则任何错误密钥的报文都能拆掉正在使用的会话。
             // 替换会释放一个名额，因此满员时仍要允许这条路径。
+            if (isAuthThrottled(sessionId)) {
+                return;
+            }
             ServerSession reconnected = createSession(clientAddr, encryptedData, true);
             if (reconnected == null) {
+                recordAuthFailure(sessionId);
                 Logger.warning(LogConfig.MODULE_KCP_SERVER, "Foreign salt packet rejected on "
                         + sessionId + ", existing session kept");
                 return;
@@ -173,8 +187,12 @@ public class LocalKcpServer {
         }
 
         if (session == null) {
+            if (isAuthThrottled(sessionId)) {
+                return;
+            }
             session = createSession(clientAddr, encryptedData, false);
             if (session == null) {
+                recordAuthFailure(sessionId);
                 Logger.warning(LogConfig.MODULE_KCP_SERVER, "Auth failed for " + sessionId);
                 return;
             }
@@ -191,6 +209,33 @@ public class LocalKcpServer {
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_KCP_SERVER, "Decrypt error: " + e.getMessage());
         }
+    }
+
+    /**
+     * 两级认证节流。真返回 true 表示该包应在支付任何解密成本前被丢弃。
+     * 窗口语义与 C++ 相同：1 秒窗口由窗口后的第一个包重置。
+     */
+    private boolean isAuthThrottled(String clientAddr) {
+        long now = System.currentTimeMillis();
+        if (now - authWindowStartMs >= 1000) {
+            authWindowStartMs = now;
+            authAttemptsInWindow = 0;
+            authFailuresByAddr.clear();
+        }
+        Integer failures = authFailuresByAddr.get(clientAddr);
+        if (failures != null && failures >= ServerConfig.MAX_AUTH_FAILURES_PER_ADDR_PER_SEC) {
+            return true;
+        }
+        if (authAttemptsInWindow >= ServerConfig.MAX_AUTH_ATTEMPTS_PER_SEC) {
+            return true;
+        }
+        authAttemptsInWindow++;
+        return false;
+    }
+
+    private void recordAuthFailure(String clientAddr) {
+        Integer failures = authFailuresByAddr.get(clientAddr);
+        authFailuresByAddr.put(clientAddr, failures == null ? 1 : failures + 1);
     }
 
     private void closeSession(String sessionId, ServerSession session) {
@@ -244,6 +289,23 @@ public class LocalKcpServer {
             }
 
             ServerSession session = new ServerSession(clientAddr, crypto);
+            // salt 墓碑：与 C++ 一致，检查与登记都在会话可见前完成；TTL 内任何
+            // 来源复用该 salt 都拒绝（防止死会话首包重放执行其中的 CONNECT）。
+            String saltKey = hexKey(crypto.sessionSalt());
+            long now = System.currentTimeMillis();
+            Long tombExpiry = saltTombstones.get(saltKey);
+            if (tombExpiry != null && tombExpiry > now) {
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "Replayed session salt rejected from "
+                        + clientAddr);
+                return null;
+            }
+            if (saltTombstones.size() >= ServerConfig.MAX_SALT_TOMBSTONES) {
+                // fail-closed：提前逐出会重新打开重放窗口
+                Logger.warning(LogConfig.MODULE_KCP_SERVER, "Salt tombstone table full ("
+                        + ServerConfig.MAX_SALT_TOMBSTONES + ")");
+                return null;
+            }
+            saltTombstones.put(saltKey, now + ServerConfig.SALT_TOMBSTONE_TTL_MS);
             session.setSendCallback(data -> sendToClient(clientAddr, data));
             session.setFrameHandler(frame -> handleFrame(session, frame));
             session.start();
@@ -277,6 +339,11 @@ public class LocalKcpServer {
             connectionManager.writeData(connectionId, frame.getPayload(), session);
         } else if (frameType == KcpFrame.TYPE_UDP_DATAGRAM) {
             handleUdpDatagram(session, frame);
+        } else if (frameType == KcpFrame.TYPE_FIN) {
+            // 客户端方向半关闭：只 shutdownOutput，目标响应继续送回
+            Logger.info(LogConfig.MODULE_KCP_SERVER, "FIN frame: connectionId=" + connectionId
+                    + ", payloadLength=" + frame.getPayloadLength());
+            connectionManager.halfCloseConnection(connectionId);
         } else if (frameType == KcpFrame.TYPE_CLOSE) {
             Logger.info(LogConfig.MODULE_KCP_SERVER, "CLOSE frame: connectionId=" + connectionId
                     + ", payloadLength=" + frame.getPayloadLength());
@@ -286,6 +353,14 @@ public class LocalKcpServer {
                     + ", payloadLength=" + frame.getPayloadLength());
             connectionManager.closeConnection(connectionId, true);
         }
+    }
+
+    private static String hexKey(byte[] salt) {
+        StringBuilder sb = new StringBuilder(salt.length * 2);
+        for (byte b : salt) {
+            sb.append(String.format(java.util.Locale.US, "%02x", b));
+        }
+        return sb.toString();
     }
 
     private void handleUdpDatagram(ServerSession session, KcpFrame frame) {
@@ -484,6 +559,14 @@ public class LocalKcpServer {
                             udpRelays.remove(entry.getKey());
                         }
                     }
+                    // 过期 salt 墓碑清扫（与 C++ do_cleanup 同职责）
+                    for (Map.Entry<String, Long> entry : saltTombstones.entrySet()) {
+                        if (entry.getValue() <= now) {
+                            saltTombstones.remove(entry.getKey());
+                        }
+                    }
+                    // 滞留的半关闭连接（目标已 EOF、客户端迟迟不 FIN）到期回收
+                    connectionManager.closeIdleConnections(ServerConfig.HALF_CLOSE_IDLE_MS);
                 } catch (InterruptedException e) {
                     break;
                 }

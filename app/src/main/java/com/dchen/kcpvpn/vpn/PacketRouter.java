@@ -25,6 +25,18 @@ public class PacketRouter {
     // 半关闭排空上限：必须大于 CppRemoteKcpSession 的 120s 宽限，
     // 否则路由器会先于会话掐断仍在接收在途数据的连接。
     private static final long CLOSING_IDLE_TIMEOUT_MS = 150 * 1000L;
+    // server→app 方向的在途段重传。TUN 写丢失的段没有别的恢复途径（内核 TCP
+    // 栈不会替我们重传我们发出的段）：应用对序号空洞回 dup-ACK，累计到阈值就
+    // 快速重传最早的未确认段；尾部段丢失收不到 dup-ACK，由清理线程按停滞超时
+    // 兜底重传。两者都依赖 addUnackedServerSegment 保留的段负载。
+    private static final int DUP_ACK_RETRANSMIT_THRESHOLD = 3;
+    private static final long RETRANSMIT_STALL_MS = 3000;
+    // 连续多次兜底重传仍无任何 ACK 进展：连接不可恢复（对端内核彻底静默），
+    // 放弃重传并回 RST，避免每 3s 无限重发。
+    private static final int MAX_STALL_RETRANSMITS = 10;
+    // 单连接滞留的未确认负载上限：应用长时间不 ACK（接收缓冲不再 drain 或进程
+    // 已死）时，超过即判定连接不可恢复，回 RST 明确失败，而不是无界吃内存。
+    private static final int MAX_UNACKED_RETAINED_BYTES = 256 * 1024;
     private static final int TCP_IPV4_HEADER_LEN = 40;
     private static final int IPV4_HEADER_LEN = 20;
     private static final int IPV6_HEADER_LEN = 40;
@@ -47,6 +59,10 @@ public class PacketRouter {
     private volatile SocketProtector socketProtector;
     private volatile CppRemoteTunnelManager cppRemoteTunnelManager;
     private volatile java.util.function.BooleanSupplier tunnelAliveSupplier;
+    // DNS 中继线程池：每查询一个 new Thread 在页面加载（10-30 个查询）下是纯
+    // 线程churn，故障/恶意应用刷 DNS 更会无上限地制造线程。固定小池排队即可，
+    // 单个查询有 5s socket 超时，任务时长有界。
+    private volatile java.util.concurrent.ExecutorService dnsRelayExecutor;
     private Thread cleanupThread;
 
     public void setSocketProtector(SocketProtector protector) {
@@ -68,6 +84,11 @@ public class PacketRouter {
 
     public void start() {
         running = true;
+        dnsRelayExecutor = java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "CPP-DNS-Relay");
+            t.setDaemon(true);
+            return t;
+        });
         startCleanupThread();
         Logger.info(LogConfig.MODULE_VPN, "PacketRouter started, localMode=" + localMode
                 + ", socketProtectorSet=" + (socketProtector != null));
@@ -78,6 +99,10 @@ public class PacketRouter {
         if (cleanupThread != null) {
             cleanupThread.interrupt();
             cleanupThread = null;
+        }
+        if (dnsRelayExecutor != null) {
+            dnsRelayExecutor.shutdownNow();
+            dnsRelayExecutor = null;
         }
         for (TcpConnection conn : connectionsById.values()) {
             conn.close();
@@ -188,6 +213,11 @@ public class PacketRouter {
         int clientAck = buf.getInt(tcpOffset + 8);
         int tcpHeaderLen = ((buf.get(tcpOffset + 12) >> 4) & 0x0F) * 4;
         int flags = buf.get(tcpOffset + 13) & 0xFF;
+        // 应用通告的接收窗口（相对其 ack）：这是我们对应用方向的唯一流控信号。
+        // 旧实现无视它（恒告 65535），应用内核缓冲填满后我们继续灌包，内核只能
+        // 丢弃窗口外的段并回 dup-ACK——没有流控时是静默丢段，有重传后则变成
+        // 无进展的重传循环。窗口耗尽即暂停转发（见 acceptOutboundSegment）。
+        int peerWindow = buf.getShort(tcpOffset + 14) & 0xFFFF;
         int payloadOffset = tcpOffset + tcpHeaderLen;
         int payloadLen = totalLen - payloadOffset;
         if (tcpHeaderLen < 20 || payloadLen < 0) {
@@ -218,6 +248,12 @@ public class PacketRouter {
         if (isSyn && !isAck) {
             synchronized (conn) {
                 conn.clientNextSeq = clientSeq + 1;
+                // 窗口基准必须锚在我们自己的序列空间：应用期望我们的第一个数据
+                // 字节落在 serverInitialSeq+1，SYN 的窗口字段是它对该方向的接收
+                // 缓冲量。锚到 clientSeq+1（对端 ISN+1，另一个方向的序列空间）
+                // 时，两个随机 ISN 的高低关系约五五开——错误基准会毒化窗口数学：
+                // 过量发送被内核丢弃后反复重传，直到累计确认爬过错误基准。
+                conn.setSendWindow(conn.serverInitialSeq + 1, peerWindow);
                 byte[] synAck = buildTcpPacket(conn, new byte[0], (byte) 0x12,
                         conn.serverInitialSeq, conn.clientNextSeq);
                 writePacketCallback.onWritePacket(synAck);
@@ -236,13 +272,43 @@ public class PacketRouter {
         }
 
         if (isAck) {
+            UnackedSegment retransmit = null;
             synchronized (conn) {
                 conn.lastAckFromClient = clientAck;
+                // 窗口随每个应用报文按 RFC 793 规则刷新；窗口重新打开时要先
+                // 冲刷滞留段，dup-ACK/快速重传逻辑才能看到完整的在途队列。
+                conn.updateSendWindow(clientAck, peerWindow);
                 if (conn.state == TcpState.SYN_RECEIVED) {
                     conn.state = TcpState.ESTABLISHED;
                 }
-                conn.removeAckedServerSegments(clientAck);
+                int removed = conn.removeAckedServerSegments(clientAck);
+                flushPendingSegments(conn, writePacketCallback);
+                if (removed > 0 || !conn.hasUnackedServerData()) {
+                    conn.resetDupAcks();
+                } else if (conn.tickDupAck()) {
+                    UnackedSegment first = conn.peekFirstUnacked();
+                    // 段已超出应用当前窗口时不白白重发（内核仍会丢弃）；窗口在
+                    // 后续报文里重新打开后，这里的 dup-ACK 计数会立即命中发送。
+                    if (first != null && conn.fitsInSendWindow(first.seq, first.length)) {
+                        retransmit = first;
+                        conn.markRetransmitted();
+                    }
+                }
                 conn.touch();
+            }
+            if (retransmit != null) {
+                byte[] retransmitPacket;
+                int ack;
+                synchronized (conn) {
+                    ack = conn.clientNextSeq;
+                    retransmitPacket = buildTcpPacket(conn, retransmit.payload, (byte) 0x18,
+                            retransmit.seq, ack);
+                }
+                writePacketCallback.onWritePacket(retransmitPacket);
+                logTcpOut(conn, 0x18, retransmit.seq, ack, retransmit.length);
+                Logger.info(LogConfig.MODULE_VPN, "Fast retransmit: connectionId=" + conn.connectionId
+                        + ", seq=" + (retransmit.seq & 0xFFFFFFFFL)
+                        + ", len=" + retransmit.length);
             }
             if (!localMode && cppRemoteTunnelManager != null) {
                 Logger.debug(LogConfig.MODULE_VPN, "Chrome ACK received connectionId=" + conn.connectionId
@@ -323,6 +389,11 @@ public class PacketRouter {
             byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10, finAckSeq, finAckAck);
             writePacketCallback.onWritePacket(ackPacket);
             logTcpOut(conn, 0x10, finAckSeq, finAckAck, 0);
+            // 本地模式：远端已经先 FIN（serverFinSeen）而应用现在也 FIN——两个
+            // 方向都结束，整体拆除；CPP_REMOTE 路径不设 serverFinSeen，不受影响。
+            if (conn.serverFinSeen) {
+                removeConnection(conn);
+            }
         }
     }
 
@@ -330,7 +401,8 @@ public class PacketRouter {
                                            int clientSeq, SendFrameCallback sendFrameCallback,
                                            WritePacketCallback writePacketCallback) {
         TcpConnection conn = new TcpConnection(nextConnectionId.incrementAndGet(), key, srcAddr, srcPort,
-                dstAddr, dstPort, (int) nextTcpSequence.addAndGet(0x10000L), sendFrameCallback);
+                dstAddr, dstPort, (int) nextTcpSequence.addAndGet(0x10000L), sendFrameCallback,
+                writePacketCallback);
         conn.clientNextSeq = clientSeq + 1;
         connectionsByKey.put(key, conn);
         connectionsById.put(conn.connectionId, conn);
@@ -340,7 +412,17 @@ public class PacketRouter {
             Logger.info(LogConfig.MODULE_VPN, "TCP SYN connectionId=" + conn.connectionId
                     + " mode=CPP_REMOTE dst=" + conn.dstHost + ":" + conn.dstPort);
             remoteManager.createConnection(conn.connectionId, conn.dstAddr, conn.dstPort,
-                    data -> handleInboundRawTcpData(conn.connectionId, data, writePacketCallback),
+                    new CppRemoteKcpSession.DataCallback() {
+                        @Override
+                        public void onData(byte[] data) {
+                            handleInboundRawTcpData(conn.connectionId, data, writePacketCallback);
+                        }
+
+                        @Override
+                        public boolean hasSendCredit() {
+                            return PacketRouter.this.hasSendCredit(conn);
+                        }
+                    },
                     reason -> handleRemoteConnectionClosed(conn.connectionId, reason, writePacketCallback));
         } else {
             byte[] openPayload = Socks5Request.buildConnectRequest(conn.dstHost, conn.dstPort);
@@ -450,21 +532,64 @@ public class PacketRouter {
                 if (payload == null) {
                     payload = new byte[0];
                 }
+                boolean unackedOverflow = false;
                 synchronized (conn) {
                     int offset = 0;
                     while (offset < payload.length) {
                         int segmentLen = Math.min(maxTcpPayload(conn), payload.length - offset);
                         byte[] segment = Arrays.copyOfRange(payload, offset, offset + segmentLen);
                         int seq = conn.serverNextSeq;
-                        byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
-                                seq, conn.clientNextSeq);
-                        writePacketCallback.onWritePacket(ipPacket);
-                        logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
-                        conn.addUnackedServerSegment(seq, segmentLen);
+                        // 窗口内 → 立即写 TUN；窗口耗尽 → 滞留 pending 等待窗口
+                        // 重新打开（由应用报文触发的 flushPendingSegments 送出）。
+                        // 登记失败（滞留总量超限）时这段绝不能已经写出去。
+                        SegmentOutcome outcome =
+                                conn.acceptOutboundSegment(seq, segment);
+                        if (outcome == SegmentOutcome.OVERFLOW) {
+                            unackedOverflow = true;
+                            break;
+                        }
+                        if (outcome == SegmentOutcome.SEND_NOW) {
+                            byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
+                                    seq, conn.clientNextSeq);
+                            writePacketCallback.onWritePacket(ipPacket);
+                            logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
+                        }
                         conn.serverNextSeq += segmentLen;
                         offset += segmentLen;
                     }
+                    if (!unackedOverflow) {
+                        conn.touch();
+                    }
+                }
+                if (unackedOverflow) {
+                    // 应用长时间不 ACK（内核接收缓冲不再 drain 或进程已死），
+                    // 继续转发只会无界吃内存。明确失败：回 RST 并拆除，
+                    // 而不是丢段造成应用侧静默的流损坏。
+                    abortConnection(conn, writePacketCallback);
+                    return;
+                }
+            } else if (frame.getFrameType() == KcpFrame.TYPE_FIN) {
+                // 本地模式：目标写侧已关闭。向应用回 FIN 但保留连接——应用的
+                // 请求方向可能仍在途（TYPE_FIN 语义，与 CPP_REMOTE 的服务器 FIN
+                // 处理一致）；应用也 FIN 后才整体拆除。
+                byte[] finPacket;
+                int seq;
+                int ack;
+                boolean bothDone;
+                synchronized (conn) {
+                    seq = conn.serverNextSeq;
+                    ack = conn.clientNextSeq;
+                    finPacket = buildTcpPacket(conn, new byte[0], (byte) 0x11, seq, ack);
+                    conn.serverNextSeq += 1;
+                    conn.serverFinSeen = true;
+                    conn.state = TcpState.CLOSING;
                     conn.touch();
+                    bothDone = conn.clientFinSeen;
+                }
+                writePacketCallback.onWritePacket(finPacket);
+                logTcpOut(conn, 0x11, seq, ack, 0);
+                if (bothDone) {
+                    removeConnection(conn);
                 }
             } else if (frame.getFrameType() == KcpFrame.TYPE_CLOSE) {
                 byte[] finAck;
@@ -504,28 +629,82 @@ public class PacketRouter {
             return;
         }
         try {
+            boolean unackedOverflow = false;
             synchronized (conn) {
                 int offset = 0;
                 while (offset < payload.length) {
                     int segmentLen = Math.min(maxTcpPayload(conn), payload.length - offset);
                     byte[] segment = Arrays.copyOfRange(payload, offset, offset + segmentLen);
                     int seq = conn.serverNextSeq;
-                    byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
-                            seq, conn.clientNextSeq);
-                    writePacketCallback.onWritePacket(ipPacket);
-                    Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE TCP OUT to TUN len=" + ipPacket.length
-                            + " connectionId=" + connectionId);
-                    logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
-                    conn.addUnackedServerSegment(seq, segmentLen);
+                    // 同 handleInboundFrame：窗口内立即写 TUN，窗口耗尽滞留 pending。
+                    SegmentOutcome outcome =
+                            conn.acceptOutboundSegment(seq, segment);
+                    if (outcome == SegmentOutcome.OVERFLOW) {
+                        unackedOverflow = true;
+                        break;
+                    }
+                    if (outcome == SegmentOutcome.SEND_NOW) {
+                        byte[] ipPacket = buildTcpPacket(conn, segment, (byte) 0x18,
+                                seq, conn.clientNextSeq);
+                        writePacketCallback.onWritePacket(ipPacket);
+                        Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE TCP OUT to TUN len=" + ipPacket.length
+                                + " connectionId=" + connectionId);
+                        logTcpOut(conn, 0x18, seq, conn.clientNextSeq, segmentLen);
+                    }
                     conn.serverNextSeq += segmentLen;
                     offset += segmentLen;
                 }
-                conn.touch();
+                if (!unackedOverflow) {
+                    conn.touch();
+                }
+            }
+            if (unackedOverflow) {
+                abortConnection(conn, writePacketCallback);
             }
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE TUN_WRITE_FAILED connectionId="
                     + connectionId + " error=" + e.getMessage());
         }
+    }
+
+    /**
+     * 把滞留在 pending 的段按序送出：只要窗口装得下就从队首逐段转为在途并写
+     * TUN。触发点是每个应用报文（isAck 分支先刷新窗口再走到这里）——窗口重新
+     * 打开往往伴随一个不含新确认的 dup-ACK，所以必须在 dup-ACK 判定之前冲刷。
+     */
+    private void flushPendingSegments(TcpConnection conn, WritePacketCallback writePacketCallback) {
+        while (conn.hasPendingSegments()) {
+            UnackedSegment seg = conn.peekFirstPending();
+            if (!conn.fitsInSendWindow(seg.seq, seg.length)) {
+                return;
+            }
+            conn.promoteFirstPending();
+            byte[] packet = buildTcpPacket(conn, seg.payload, (byte) 0x18,
+                    seg.seq, conn.clientNextSeq);
+            writePacketCallback.onWritePacket(packet);
+            logTcpOut(conn, 0x18, seg.seq, conn.clientNextSeq, seg.length);
+        }
+    }
+
+    /**
+     * 不可恢复时强制拆链：关远端会话、向应用回 RST、摘除本地映射。
+     * 应用看到的是明确的连接重置（可以立即重试），而不是静默丢段导致的挂死。
+     */
+    private void abortConnection(TcpConnection conn, WritePacketCallback writePacketCallback) {
+        sendCloseToOutbound(conn, conn.sendFrameCallback, true);
+        byte[] rst;
+        synchronized (conn) {
+            rst = buildTcpPacket(conn, new byte[0], (byte) 0x14,
+                    conn.serverNextSeq, conn.clientNextSeq);
+        }
+        try {
+            writePacketCallback.onWritePacket(rst);
+        } catch (Exception e) {
+            Logger.error(LogConfig.MODULE_VPN, "Abort RST write failed: " + e.getMessage());
+        }
+        removeConnection(conn);
+        Logger.info(LogConfig.MODULE_VPN, "ABORT connectionId=" + conn.connectionId
+                + " reason=unacked_overflow");
     }
 
     private void handleRemoteConnectionClosed(long connectionId, String reason,
@@ -537,6 +716,8 @@ public class PacketRouter {
         try {
             byte[] packet;
             int flags;
+            int sentSeq;
+            int sentAck;
             synchronized (conn) {
                 conn.state = TcpState.CLOSING;
                 // 用 CppRemoteKcpSession 的显式白名单判定，而不是在 reason 里找
@@ -544,14 +725,18 @@ public class PacketRouter {
                 // CRYPTO_MISMATCH / KCP_BACKPRESSURE_OVERFLOW 都是失败但不含
                 // "FAILED"，旧写法会回 FIN，应用看到干净 EOF 而察觉不到截断。
                 flags = CppRemoteKcpSession.isGracefulCloseReason(reason) ? 0x11 : 0x14;
+                // 日志 seq 必须在自增前取：FIN 的 seq 是发出值，serverNextSeq 随后
+                // +1，旧写法在锁外用已自增的值打日志，与实际发出的差 1。
+                sentSeq = conn.serverNextSeq;
+                sentAck = conn.clientNextSeq;
                 packet = buildTcpPacket(conn, new byte[0], (byte) flags,
-                        conn.serverNextSeq, conn.clientNextSeq);
+                        sentSeq, sentAck);
                 if (flags == 0x11) {
                     conn.serverNextSeq += 1;
                 }
             }
             writePacketCallback.onWritePacket(packet);
-            logTcpOut(conn, flags, conn.serverNextSeq, conn.clientNextSeq, 0);
+            logTcpOut(conn, flags, sentSeq, sentAck, 0);
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE close write failed connectionId="
                     + connectionId + " error=" + e.getMessage());
@@ -580,13 +765,20 @@ public class PacketRouter {
             }
             return;
         }
-        sendFrameCallback.onSendFrame(new KcpFrame(reset ? KcpFrame.TYPE_RESET : KcpFrame.TYPE_CLOSE,
+        // 本地模式：半关闭走 TYPE_FIN（服务器端 shutdownOutput，目标的在途响应
+        // 不被截断）；TYPE_CLOSE 保留为整体关闭语义，只在双方都完成后由远端
+        // 显式发出。
+        sendFrameCallback.onSendFrame(new KcpFrame(reset ? KcpFrame.TYPE_RESET : KcpFrame.TYPE_FIN,
                 conn.connectionId, null));
     }
 
     private void relayDnsLocally(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort, byte[] payload,
                                  WritePacketCallback writePacketCallback) {
-        new Thread(() -> {
+        java.util.concurrent.ExecutorService relay = dnsRelayExecutor;
+        if (relay == null) {
+            return;  // 路由器已停止
+        }
+        relay.execute(() -> {
             try (DatagramSocket socket = new DatagramSocket()) {
                 boolean protectedOk = socketProtector != null && socketProtector.protect(socket);
                 Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE DNS UDP IN query="
@@ -612,7 +804,7 @@ public class PacketRouter {
             } catch (Exception e) {
                 Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE DNS_FAILED error=" + e.getMessage());
             }
-        }, "CPP-DNS-Relay").start();
+        });
     }
 
     /**
@@ -627,6 +819,18 @@ public class PacketRouter {
         }
         java.util.function.BooleanSupplier supplier = tunnelAliveSupplier;
         return supplier != null && supplier.getAsBoolean();
+    }
+
+    /**
+     * 连接的应用方向是否仍有发送额度。false 时 CPP_REMOTE 会话停止从 KCP 取数，
+     * 让 KCP 接收窗口收紧、把背压传回服务器（服务器侧 forward 循环随即停读目标
+     * socket）。滞留 pending 只是"额度判断与窗口关闭"之间竞态的兜底，正常情况
+     * 下数据应留在 KCP 而不是进入路由器。
+     */
+    private boolean hasSendCredit(TcpConnection conn) {
+        synchronized (conn) {
+            return conn.hasSendCredit();
+        }
     }
 
     private void removeConnection(TcpConnection conn) {
@@ -874,9 +1078,41 @@ public class PacketRouter {
         cleanupThread = new Thread(() -> {
             while (running) {
                 try {
-                    Thread.sleep(10_000);
+                    // 1s 粒度：驱动停滞重传兜底（3s 阈值），也让陈旧回收更及时。
+                    Thread.sleep(1000);
                     long now = System.currentTimeMillis();
                     for (TcpConnection conn : connectionsById.values()) {
+                        // 兜底重传先于回收判定：有未确认在途段时连接是"停滞"而非
+                        // "陈旧"。尾部段丢失收不到 dup-ACK，只有这里能把流救回来。
+                        UnackedSegment stalled =
+                                conn.pollStalledRetransmit(now, RETRANSMIT_STALL_MS);
+                        if (stalled != null) {
+                            byte[] packet;
+                            int ack;
+                            synchronized (conn) {
+                                ack = conn.clientNextSeq;
+                                packet = buildTcpPacket(conn, stalled.payload, (byte) 0x18,
+                                        stalled.seq, ack);
+                            }
+                            try {
+                                conn.writePacketCallback.onWritePacket(packet);
+                                logTcpOut(conn, 0x18, stalled.seq, ack, stalled.length);
+                                Logger.info(LogConfig.MODULE_VPN, "Stall retransmit: connectionId="
+                                        + conn.connectionId
+                                        + ", seq=" + (stalled.seq & 0xFFFFFFFFL)
+                                        + ", len=" + stalled.length
+                                        + ", attempt=" + conn.stalledRetransmitCount());
+                            } catch (Exception e) {
+                                Logger.error(LogConfig.MODULE_VPN,
+                                        "Stall retransmit write failed: " + e.getMessage());
+                            }
+                            if (conn.stalledRetransmitCount() > MAX_STALL_RETRANSMITS) {
+                                // 多次兜底重传后仍无任何 ACK 进展：对端内核彻底静默，
+                                // 连接不可恢复。回 RST 明确失败并回收，不再无限重发。
+                                abortConnection(conn, conn.writePacketCallback);
+                            }
+                            continue;
+                        }
                         long age = now - conn.lastActivityTime;
                         if (conn.state == TcpState.ESTABLISHED) {
                             if (age <= ESTABLISHED_IDLE_TIMEOUT_MS) {
@@ -901,6 +1137,19 @@ public class PacketRouter {
                         // 远端会话与 UDP socket 将一直泄漏。
                         sendCloseToOutbound(conn, conn.sendFrameCallback,
                                 conn.state != TcpState.ESTABLISHED);
+                        // 回收时必须向应用回 RST：此时远端会话已关闭，缺了这个包
+                        // 应用只会看到连接静默挂死，直到自己的超时才放弃。
+                        byte[] rst;
+                        synchronized (conn) {
+                            rst = buildTcpPacket(conn, new byte[0], (byte) 0x14,
+                                    conn.serverNextSeq, conn.clientNextSeq);
+                        }
+                        try {
+                            conn.writePacketCallback.onWritePacket(rst);
+                        } catch (Exception e) {
+                            Logger.error(LogConfig.MODULE_VPN,
+                                    "Cleanup RST write failed: " + e.getMessage());
+                        }
                         removeConnection(conn);
                     }
                 } catch (InterruptedException e) {
@@ -957,18 +1206,42 @@ public class PacketRouter {
         private final String dstHost;
         private final int serverInitialSeq;
         private final SendFrameCallback sendFrameCallback;
+        // 写 TUN 的回调随连接保存：重传与回收路径在各自线程上也要能把包写进 TUN。
+        private final WritePacketCallback writePacketCallback;
         private int clientNextSeq;
         private int serverNextSeq;
         private int lastAckFromClient;
+        // server→app 方向的在途段登记（保留负载以备重传）。TUN 写丢失的段没有
+        // 其他恢复途径：靠应用 dup-ACK（快速）或清理线程停滞兜底重传，直到确认。
         private final Deque<UnackedSegment> unackedServerData;
+        private int unackedBytes;
+        // 窗口耗尽时滞留的未发送段（应用报文刷新窗口后由 flushPendingSegments
+        // 按序送出）。与 unacked 共享同一个滞留总量上限。
+        private final Deque<UnackedSegment> pendingQueue = new ArrayDeque<>();
+        private int pendingBytes;
+        // 应用最近通告的接收窗口及其基准 ack：段 [ack, ack+window) 之内才允许
+        // 写 TUN（无符号回绕比较见 fitsInSendWindow）。
+        private int appWindowAck;
+        private int appWindow;
+        // 连续无进展的 dup-ACK 计数；达到阈值触发快速重传并复位。
+        private int dupAckCount;
+        // 上次 ACK 确认掉在途段的时刻（停滞重传的时间基准）。
+        private long lastAckProgressMs;
+        // 上次重传（快速或兜底）的时刻，避免两条重传路径对同一段背靠背重发。
+        private long lastRetransmitMs;
+        // 连续"无任何 ACK 进展"的兜底重传次数；超过上限判定连接不可恢复。
+        private int stalledRetransmitCount;
         private long lastActivityTime;
         private TcpState state;
         private boolean synAckSent;
         private boolean clientFinSeen;
+        // 本地模式：远端（frame 协议 TYPE_FIN）已声明不再发送。
+        private boolean serverFinSeen;
         private volatile boolean closed;
 
         TcpConnection(long connectionId, String key, byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
-                      int initialServerSeq, SendFrameCallback sendFrameCallback) {
+                      int initialServerSeq, SendFrameCallback sendFrameCallback,
+                      WritePacketCallback writePacketCallback) {
             this.connectionId = connectionId;
             this.key = key;
             this.srcAddr = Arrays.copyOf(srcAddr, srcAddr.length);
@@ -979,10 +1252,12 @@ public class PacketRouter {
             this.dstHost = addressToString(dstAddr);
             this.serverInitialSeq = initialServerSeq;
             this.sendFrameCallback = sendFrameCallback;
+            this.writePacketCallback = writePacketCallback;
             this.clientNextSeq = 0;
             this.serverNextSeq = initialServerSeq;
             this.lastAckFromClient = 0;
             this.unackedServerData = new ArrayDeque<>();
+            this.lastAckProgressMs = System.currentTimeMillis();
             this.lastActivityTime = System.currentTimeMillis();
             this.state = TcpState.SYN_RECEIVED;
             this.synAckSent = false;
@@ -993,20 +1268,170 @@ public class PacketRouter {
             lastActivityTime = System.currentTimeMillis();
         }
 
-        void addUnackedServerSegment(int seq, int length) {
-            if (length > 0) {
-                unackedServerData.addLast(new UnackedSegment(seq, length));
+        /** 记录应用最近通告的接收窗口（相对其 ack）。仅用于连接初始化。 */
+        void setSendWindow(int ack, int window) {
+            appWindowAck = ack;
+            appWindow = window;
+        }
+
+        /**
+         * RFC 793 式窗口更新：确认推进时无条件采纳；确认不动时只在窗口扩大时
+         * 采纳。窗口字段总是相对其 ack 的剩余量，ack 不动时窗口不会被合理地
+         * 收缩（收缩只随新数据发生，而新数据会推进 ack）——采纳同确认上的收缩
+         * 值会让发送端被陈旧值自缚、该发的数据发不出去。
+         */
+        void updateSendWindow(int ack, int window) {
+            if (ack != appWindowAck
+                    ? seqAfterOrEqual(ack, appWindowAck)
+                    : window > appWindow) {
+                appWindowAck = ack;
+                appWindow = window;
             }
         }
 
-        void removeAckedServerSegments(int ack) {
+        /**
+         * 段是否完整落在应用当前通告的窗口内。窗口为 0（应用缓冲满）时一律
+         * false——新段滞留、快速重传跳过，等待应用报文携带的新窗口。
+         */
+        boolean fitsInSendWindow(int seq, int len) {
+            if (appWindow <= 0) {
+                return false;
+            }
+            return seqAfterOrEqual(appWindowAck + appWindow, seq + len);
+        }
+
+        boolean hasUnackedServerData() {
+            return !unackedServerData.isEmpty();
+        }
+
+        boolean hasPendingSegments() {
+            return !pendingQueue.isEmpty();
+        }
+
+        /**
+         * 是否可以继续从隧道取新数据写入本连接：窗口未耗尽、滞留未超限、且
+         * 下一个字节能装进当前窗口。三者的组合保证"取数-写入"不越过应用通告
+         * 的接收能力；false 时调用方（CPP_REMOTE 会话）停止从 KCP 取数。
+         */
+        boolean hasSendCredit() {
+            return appWindow > 0
+                    && unackedBytes + pendingBytes < MAX_UNACKED_RETAINED_BYTES
+                    && fitsInSendWindow(serverNextSeq, 1);
+        }
+
+        UnackedSegment peekFirstPending() {
+            return pendingQueue.peekFirst();
+        }
+
+        /** pending 队首转入在途（由调用方立刻写 TUN），保持与登记时相同的顺序。 */
+        void promoteFirstPending() {
+            UnackedSegment seg = pendingQueue.pollFirst();
+            pendingBytes -= seg.length;
+            unackedServerData.addLast(seg);
+            unackedBytes += seg.length;
+        }
+
+        /**
+         * 登记一个待发段。
+         * @return SEND_NOW：已登记为在途，调用方须立即写 TUN；
+         *         HELD：窗口耗尽，已滞留 pending，等窗口重新打开；
+         *         OVERFLOW：滞留总量超过上限（应用长时间不确认），调用方应放弃连接。
+         */
+        SegmentOutcome acceptOutboundSegment(int seq, byte[] payload) {
+            if (payload.length == 0) {
+                return SegmentOutcome.SEND_NOW;
+            }
+            if (unackedBytes + pendingBytes + payload.length > MAX_UNACKED_RETAINED_BYTES) {
+                return SegmentOutcome.OVERFLOW;
+            }
+            if (pendingQueue.isEmpty() && fitsInSendWindow(seq, payload.length)) {
+                unackedServerData.addLast(new UnackedSegment(seq, payload));
+                unackedBytes += payload.length;
+                return SegmentOutcome.SEND_NOW;
+            }
+            pendingQueue.addLast(new UnackedSegment(seq, payload));
+            pendingBytes += payload.length;
+            return SegmentOutcome.HELD;
+        }
+
+        /** 移除被 ack 完全覆盖的段。返回移除数；任何进展都复位 dup-ACK 与兜底计数。 */
+        int removeAckedServerSegments(int ack) {
+            int removed = 0;
             while (!unackedServerData.isEmpty()) {
                 UnackedSegment segment = unackedServerData.peekFirst();
                 if (seqAfterOrEqual(ack, segment.endSeq())) {
                     unackedServerData.removeFirst();
+                    unackedBytes -= segment.length;
+                    removed++;
                 } else {
                     break;
                 }
+            }
+            if (removed > 0) {
+                lastAckProgressMs = System.currentTimeMillis();
+                dupAckCount = 0;
+                stalledRetransmitCount = 0;
+            }
+            return removed;
+        }
+
+        /** 累计无进展 dup-ACK；达到阈值时复位计数并返回 true（触发快速重传）。 */
+        boolean tickDupAck() {
+            dupAckCount++;
+            if (dupAckCount < DUP_ACK_RETRANSMIT_THRESHOLD) {
+                return false;
+            }
+            dupAckCount = 0;
+            return true;
+        }
+
+        void resetDupAcks() {
+            dupAckCount = 0;
+        }
+
+        UnackedSegment peekFirstUnacked() {
+            return unackedServerData.peekFirst();
+        }
+
+        void markRetransmitted() {
+            lastRetransmitMs = System.currentTimeMillis();
+        }
+
+        int stalledRetransmitCount() {
+            return stalledRetransmitCount;
+        }
+
+        /**
+         * 清理线程的停滞兜底：没有任何 ACK 进展（典型是尾部段丢失，收不到
+         * dup-ACK）超过 stallMs，就交回最早的待发/在途段。优先在途段（重传），
+         * 在途为空而 pending 非空时交回队首 pending 段（兼作零窗口探测）——此时
+         * 它从未被发出，转登记为在途。返回 null 表示本轮无需重传。
+         */
+        UnackedSegment pollStalledRetransmit(long now, long stallMs) {
+            synchronized (this) {
+                UnackedSegment candidate;
+                boolean fromPending = false;
+                if (!unackedServerData.isEmpty()) {
+                    candidate = unackedServerData.peekFirst();
+                } else if (!pendingQueue.isEmpty()) {
+                    candidate = pendingQueue.peekFirst();
+                    fromPending = true;
+                } else {
+                    return null;
+                }
+                long reference = Math.max(lastAckProgressMs, lastRetransmitMs);
+                if (now - reference < stallMs) {
+                    return null;
+                }
+                lastRetransmitMs = now;
+                stalledRetransmitCount++;
+                if (fromPending) {
+                    pendingQueue.pollFirst();
+                    pendingBytes -= candidate.length;
+                    unackedServerData.addLast(candidate);
+                    unackedBytes += candidate.length;
+                }
+                return candidate;
             }
         }
 
@@ -1015,13 +1440,22 @@ public class PacketRouter {
         }
     }
 
+    /** acceptOutboundSegment 的结果（见其注释）。 */
+    private enum SegmentOutcome {
+        SEND_NOW,
+        HELD,
+        OVERFLOW
+    }
+
     private static class UnackedSegment {
         private final int seq;
         private final int length;
+        private final byte[] payload;
 
-        UnackedSegment(int seq, int length) {
+        UnackedSegment(int seq, byte[] payload) {
             this.seq = seq;
-            this.length = length;
+            this.payload = payload;
+            this.length = payload.length;
         }
 
         int endSeq() {

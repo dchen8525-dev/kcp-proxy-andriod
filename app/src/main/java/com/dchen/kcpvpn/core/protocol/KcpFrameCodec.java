@@ -130,6 +130,7 @@ public class KcpFrameCodec {
         return frameType == KcpFrame.TYPE_OPEN
                 || frameType == KcpFrame.TYPE_DATA
                 || frameType == KcpFrame.TYPE_CLOSE
+                || frameType == KcpFrame.TYPE_FIN
                 || frameType == KcpFrame.TYPE_RESET
                 || frameType == KcpFrame.TYPE_UDP_DATAGRAM
                 || frameType == KcpFrame.TYPE_HELLO

@@ -125,7 +125,10 @@ public class Crypto {
                 throw new IllegalStateException("encrypt called before the session salt was established");
             }
             if (encryptCounter >= CryptoConfig.MAX_COUNTER) {
-                throw new RuntimeException("Encryption counter overflow - session must be rekeyed");
+                // 专用类型：调用方能区分"计数器耗尽（会话必须重建）"和普通 IO 失败，
+                // 关闭原因才不会误标成 UDP_SEND_FAILED。
+                throw new CounterOverflowException(
+                        "Encryption counter overflow - session must be rekeyed");
             }
 
             long counter = encryptCounter++;
@@ -254,6 +257,13 @@ public class Crypto {
     /** 重放/过期计数器拒绝：正常 UDP 乱序现象，不是会话错误。 */
     public static class ReplayRejectedException extends Exception {
         public ReplayRejectedException(String message) {
+            super(message);
+        }
+    }
+
+    /** 加密计数器达到 MAX_COUNTER(2^48)：本会话的 nonce 空间已耗尽，必须重建会话。 */
+    public static class CounterOverflowException extends RuntimeException {
+        public CounterOverflowException(String message) {
             super(message);
         }
     }

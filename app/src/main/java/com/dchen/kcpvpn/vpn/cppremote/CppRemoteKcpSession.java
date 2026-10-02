@@ -16,6 +16,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.Queue;
 import java.util.concurrent.ScheduledExecutorService;
@@ -41,7 +42,8 @@ public class CppRemoteKcpSession {
     // 半关闭宽限（与 C++ CLIENT_HALF_CLOSE_GRACE_SEC = 2 * KCP_TIMEOUT_SEC 一致）：
     // 本地 FIN 后，仅凭送达应用的真实数据续命，排空停滞则回收。
     private static final int HALF_CLOSE_GRACE_MS = 120_000;
-    // 认证失败阈值：轮询运行在单线程调度器上，计数无需同步。
+    // 认证失败阈值：同一会话的轮询由其固定频率任务串行执行（scheduleAtFixedRate
+    // 保证不并发同一任务，见 CppRemoteTunnelManager 的多线程说明），计数无需同步。
     private static final int MAX_AUTH_FAILURES = 8;
     // 背压排队上限：TUN 侧已对所有字节回 ACK，Chrome 感知不到拥塞，
     // 链路停摆时出站只能自我封顶；超过即判定会话不可恢复，明确失败而不是无限吃内存。
@@ -65,6 +67,11 @@ public class CppRemoteKcpSession {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final CppSocks5ResponseBuffer socks5ResponseBuffer = new CppSocks5ResponseBuffer();
     private final ByteBuffer udpRecvBuffer = ByteBuffer.allocate(UDP_RECV_BUF_SIZE);
+    // KCP 接收复用缓冲：每条消息临时 new max(peek, 64KB) 在高吞吐下是每秒几十
+    // MB 的 GC 压力（22 字节的 keepalive 也要 64KB）。消息在锁内消费后才拷出，
+    // 复用安全；peek 超过缓冲（理论上不会发生，发送端按 FWD_BUF_SIZE 切块）才
+    // 退回一次性分配。
+    private final byte[] kcpRecvBuffer = new byte[KCP_RECV_BUF_SIZE];
 
     private final AtomicLong lastKeepaliveSentMs = new AtomicLong(0);
     private final AtomicLong lastHalfCloseProgressMs = new AtomicLong(0);
@@ -251,6 +258,10 @@ public class CppRemoteKcpSession {
                 }
                 drainOutboundQueue();
                 pollUdpPackets();
+                // 背压恢复重驱：窗口耗尽时 deliverKcpData 提前返回、数据留在
+                // KCP；应用窗口重新打开后靠这里的 10ms 周期继续取数（无数据时
+                // peekSize<=0 直接返回，是廉价 no-op）。
+                deliverKcpData();
                 maybeSendKeepalive();
                 maybeCheckHalfCloseGrace();
             } catch (Exception e) {
@@ -380,19 +391,26 @@ public class CppRemoteKcpSession {
         // salt 每会话固定，循环外取一次即可
         final byte[] salt = crypto.sessionSalt();
         while (running) {
+            if (!dataCallback.hasSendCredit()) {
+                // 应用接收窗口耗尽：数据留在 KCP。KCP 接收队列收紧后通告窗口
+                // 收缩，服务器侧 forward 循环随即停读目标 socket——背压传回源头。
+                // 本会话的 10ms tick 与下一个入站报文都会重驱本循环。
+                return;
+            }
             byte[] data;
             synchronized (kcpLock) {
                 int peek = kcp.peekSize();
                 if (peek <= 0) {
                     return;
                 }
-                byte[] recv = new byte[Math.max(peek, KCP_RECV_BUF_SIZE)];
+                byte[] recv = peek <= kcpRecvBuffer.length
+                        ? kcpRecvBuffer
+                        : new byte[peek];
                 int len = kcp.recv(recv);
                 if (len <= 0) {
                     return;
                 }
-                data = new byte[len];
-                System.arraycopy(recv, 0, data, 0, len);
+                data = Arrays.copyOf(recv, len);
             }
 
             // 控制消息在交给任何消费者之前先剥掉（与 C++ KcpTunnel::handle_read 同序）：
@@ -667,6 +685,12 @@ public class CppRemoteKcpSession {
             Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE UDP send to "
                     + serverAddr.getHostString() + ":" + serverAddr.getPort()
                     + " len=" + encrypted.length + " connectionId=" + connectionId);
+        } catch (Crypto.CounterOverflowException e) {
+            // 计数器达到 2^48：此后每个加密都会失败，会话已无法续用，立即拆除。
+            // 单独捕获，关闭原因不与普通 UDP 发送失败混在一起。
+            Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE crypto counter overflow connectionId="
+                    + connectionId + " error=" + e.getMessage());
+            close("CRYPTO_COUNTER_OVERFLOW");
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE UDP_SEND_FAILED connectionId="
                     + connectionId + " error=" + e.getMessage());
@@ -753,6 +777,16 @@ public class CppRemoteKcpSession {
 
     public interface DataCallback {
         void onData(byte[] data);
+
+        /**
+         * 该连接在应用方向是否还有发送额度（应用通告窗口未耗尽且滞留未超限）。
+         * 返回 false 时会话停止从 KCP 取数——KCP 接收队列随之收紧、通告窗口收
+         * 缩，背压沿 "KCP 窗口 → C++ 服务器 → 目标 TCP" 传回，而不是把数据滞留
+         * 在本地直到 RST。默认 true 保持既有实现兼容。
+         */
+        default boolean hasSendCredit() {
+            return true;
+        }
     }
 
     public interface CloseCallback {

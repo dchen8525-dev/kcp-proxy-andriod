@@ -93,6 +93,9 @@ public class KcpClientSession {
         try {
             udpSocket = new DatagramSocket();
             udpSocket.setSoTimeout(1000);
+            // connect 到服务器地址：内核在源头丢弃非服务器来源的包（与 C++ 客户端、
+            // CppRemoteKcpSession 同一防护），伪造/杂散报文不再进解密路径。
+            udpSocket.connect(serverAddr);
             try {
                 udpSocket.setReceiveBufferSize(SessionConfig.UDP_SO_RCVBUF_BYTES);
                 udpSocket.setSendBufferSize(SessionConfig.UDP_SO_SNDBUF_BYTES);
@@ -206,6 +209,10 @@ public class KcpClientSession {
             }
 
             tryDeliverFrames();
+        } catch (Crypto.ReplayRejectedException e) {
+            // UDP 重排/重复的正常现象：与 CppRemoteKcpSession 一致按 DEBUG 丢弃，
+            // 不计入任何失败阈值，也不产生 ERROR 噪音。
+            Logger.debug(LogConfig.MODULE_KCP_CLIENT, "replay/stale packet discarded: " + e.getMessage());
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_KCP_CLIENT, "Receive error: " + e.getMessage());
         }

@@ -48,7 +48,11 @@ public class CppRemoteTunnelManager {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE start failed: missing SocketProtector");
             return false;
         }
-        kcpScheduler = Executors.newScheduledThreadPool(1,
+        // 4 个调度线程（而非 1）：会话的 KCP tick 里有同步的 TUN 写，单线程会让
+        // 一个会话的写停顿阻塞所有其它会话的 10ms tick（队头阻塞，重下载时表现为
+        // 全局吞吐塌陷）。多线程后停顿只影响同一线程上的少数会话。同一会话的任务
+        // 仍然串行（scheduleAtFixedRate 保证不并发同一任务），会话内部状态无需加锁。
+        kcpScheduler = Executors.newScheduledThreadPool(4,
                 namedThreadFactory("CPP-KCP-Update"));
         running = true;
         Logger.info(LogConfig.MODULE_VPN, "mode=CPP_REMOTE server=" + serverHost + ":" + serverPort

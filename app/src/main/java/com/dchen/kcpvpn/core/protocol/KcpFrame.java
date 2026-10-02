@@ -9,6 +9,10 @@ public class KcpFrame {
     public static final byte TYPE_CLOSE = 3;
     public static final byte TYPE_RESET = 4;
     public static final byte TYPE_UDP_DATAGRAM = 5;
+    // 半关闭："本方向不再发送数据"，对端保持连接继续收发另一方向。
+    // TYPE_CLOSE 是整体关闭；FIN 语义与 C++ V2 的 KCP_PROXY_FIN 对齐。
+    // frame 协议只在 Android 两侧使用（本地模式），没有对 C++ 的兼容负担。
+    public static final byte TYPE_FIN = 6;
     public static final byte TYPE_HELLO = 100;
     public static final byte TYPE_HELLO_ACK = 101;
     public static final byte TYPE_PING = 102;
@@ -52,6 +56,8 @@ public class KcpFrame {
                 return "RESET";
             case TYPE_UDP_DATAGRAM:
                 return "UDP_DATAGRAM";
+            case TYPE_FIN:
+                return "FIN";
             case TYPE_HELLO:
                 return "HELLO";
             case TYPE_HELLO_ACK:
