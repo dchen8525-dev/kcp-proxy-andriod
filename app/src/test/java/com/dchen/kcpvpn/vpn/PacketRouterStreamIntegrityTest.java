@@ -56,6 +56,8 @@ public class PacketRouterStreamIntegrityTest {
     /** true：只丢尾段（驱动清理线程的停滞重传探测）；false：按 DROP_PERCENT 随机丢。 */
     private boolean dropTailOnly;
     private boolean tailDropUsed;
+    /** true：乱序到达不回 dup-ACK（模拟 dup-ACK 全丢），修复只能靠 stall-probe。 */
+    private boolean suppressDupAcks;
 
     // ---- 注入的载荷 ----
     private byte[] fullPayload;
@@ -72,6 +74,7 @@ public class PacketRouterStreamIntegrityTest {
         rng.setSeed(dropSeed);
         clientIsn = isn;
         tailDropUsed = false;
+        suppressDupAcks = false;
         sendFromApp(0x02, 0, 0, new byte[0], 65535);
         connectionId = frames.get(frames.size() - 1).getConnectionId();
 
@@ -149,8 +152,10 @@ public class PacketRouterStreamIntegrityTest {
             sendAckWithWalk();
         } else if (seqAfter(seq, nextExpectedSeq)) {
             beyond.put(seq, payload);
-            for (int i = 0; i < 3; i++) {
-                sendAckWithWalk(); // 3 个 dup-ACK 触发快速重传
+            if (!suppressDupAcks) {
+                for (int i = 0; i < 3; i++) {
+                    sendAckWithWalk(); // 3 个 dup-ACK 触发快速重传
+                }
             }
         } else {
             sendAckWithWalk(); // 重复段：重 ACK 当前位置
@@ -222,9 +227,8 @@ public class PacketRouterStreamIntegrityTest {
         assertTrue("预热后尾段应尚未送达（丢包注入生效）",
                 nextExpectedSeq != totalEndSeq);
 
-        // 清理线程 1s 节奏 + 3s 停滞阈值，每次探测重传最早的未确认段：修复
-        // N 个散布的丢段约需 N×3s（含重传再丢的概率余量）。本用例注入 16KB
-        // （约 12 段、20% 概率随机丢 + 尾段）→ 预期 3-5 次探测，30s 足够宽裕。
+        // 清理线程 1s 节奏 + 3s 停滞阈值；探测按整窗重传，一轮即覆盖全部
+        // 未确认段。本用例注入 16KB（约 12 段、20% 概率随机丢 + 尾段）。
         long deadline = System.currentTimeMillis() + 30_000;
         while (nextExpectedSeq != totalEndSeq && System.currentTimeMillis() < deadline) {
             Thread.sleep(250);
@@ -232,6 +236,32 @@ public class PacketRouterStreamIntegrityTest {
         }
 
         assertEquals("stall-probe 必须修复尾段丢失", totalEndSeq, nextExpectedSeq);
+        assertArrayEquals(fullPayload, delivered.toByteArray());
+    }
+
+    @Test
+    public void multiHoleLossRepairedBySingleStallProbe() throws Exception {
+        // dup-ACK 全丢（对端静默）：乱序段全部滞留在应用侧，快速重传没有触发
+        // 信号——整窗探测重传成为唯一修复途径。一次探测应把窗口内的全部丢失
+        // 段一轮补齐，而不是每 3 秒爬一段。
+        injectTransfer(1_100_000, 24 * 1024, 0x5EED555L);
+        suppressDupAcks = true;
+        DROP_PERCENT_OVERRIDE = 25;
+        try {
+            drainToApp(0);
+            assertTrue("预热后应有未交付缺口", nextExpectedSeq != totalEndSeq);
+
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (nextExpectedSeq != totalEndSeq
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(250);
+                drainToApp(0);
+            }
+        } finally {
+            DROP_PERCENT_OVERRIDE = 0;
+        }
+
+        assertEquals("一次整窗探测必须修复全部缺口", totalEndSeq, nextExpectedSeq);
         assertArrayEquals(fullPayload, delivered.toByteArray());
     }
 

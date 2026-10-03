@@ -14,8 +14,10 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -1084,28 +1086,32 @@ public class PacketRouter {
                     for (TcpConnection conn : connectionsById.values()) {
                         // 兜底重传先于回收判定：有未确认在途段时连接是"停滞"而非
                         // "陈旧"。尾部段丢失收不到 dup-ACK，只有这里能把流救回来。
-                        UnackedSegment stalled =
-                                conn.pollStalledRetransmit(now, RETRANSMIT_STALL_MS);
-                        if (stalled != null) {
-                            byte[] packet;
-                            int ack;
-                            synchronized (conn) {
-                                ack = conn.clientNextSeq;
-                                packet = buildTcpPacket(conn, stalled.payload, (byte) 0x18,
-                                        stalled.seq, ack);
+                        java.util.List<UnackedSegment> stalledBatch =
+                                conn.collectStalledRetransmits(now, RETRANSMIT_STALL_MS);
+                        if (!stalledBatch.isEmpty()) {
+                            // 与 TCP RTO 的整窗重传同形：一次探测把窗口允许范围内
+                            // 的全部未确认段一并重发，散布的多点丢包一轮修复，而不
+                            // 是每 3 秒一段地爬。
+                            for (UnackedSegment stalled : stalledBatch) {
+                                byte[] packet;
+                                int ack;
+                                synchronized (conn) {
+                                    ack = conn.clientNextSeq;
+                                    packet = buildTcpPacket(conn, stalled.payload, (byte) 0x18,
+                                            stalled.seq, ack);
+                                }
+                                try {
+                                    conn.writePacketCallback.onWritePacket(packet);
+                                    logTcpOut(conn, 0x18, stalled.seq, ack, stalled.length);
+                                } catch (Exception e) {
+                                    Logger.error(LogConfig.MODULE_VPN,
+                                            "Stall retransmit write failed: " + e.getMessage());
+                                }
                             }
-                            try {
-                                conn.writePacketCallback.onWritePacket(packet);
-                                logTcpOut(conn, 0x18, stalled.seq, ack, stalled.length);
-                                Logger.info(LogConfig.MODULE_VPN, "Stall retransmit: connectionId="
-                                        + conn.connectionId
-                                        + ", seq=" + (stalled.seq & 0xFFFFFFFFL)
-                                        + ", len=" + stalled.length
-                                        + ", attempt=" + conn.stalledRetransmitCount());
-                            } catch (Exception e) {
-                                Logger.error(LogConfig.MODULE_VPN,
-                                        "Stall retransmit write failed: " + e.getMessage());
-                            }
+                            Logger.info(LogConfig.MODULE_VPN, "Stall retransmit: connectionId="
+                                    + conn.connectionId
+                                    + ", segments=" + stalledBatch.size()
+                                    + ", attempt=" + conn.stalledRetransmitCount());
                             if (conn.stalledRetransmitCount() > MAX_STALL_RETRANSMITS) {
                                 // 多次兜底重传后仍无任何 ACK 进展：对端内核彻底静默，
                                 // 连接不可恢复。回 RST 明确失败并回收，不再无限重发。
@@ -1403,36 +1409,43 @@ public class PacketRouter {
 
         /**
          * 清理线程的停滞兜底：没有任何 ACK 进展（典型是尾部段丢失，收不到
-         * dup-ACK）超过 stallMs，就交回最早的待发/在途段。优先在途段（重传），
-         * 在途为空而 pending 非空时交回队首 pending 段（兼作零窗口探测）——此时
-         * 它从未被发出，转登记为在途。返回 null 表示本轮无需重传。
+         * dup-ACK）超过 stallMs，就交回本连接需要重传的段——与 TCP RTO 的整窗
+         * 重传同形：<b>首个</b>未确认段必含（兼作零窗口探测，窗口为 0 时也发），
+         * 其后窗口装得下的未确认段一并重发，散布的多点丢包一轮修复，而不是每
+         * 3 秒爬一段。在途为空而 pending 非空时，队首滞留段从未发出，转登记为
+         * 在途后随本批写出。返回空列表表示本轮无需重传。
          */
-        UnackedSegment pollStalledRetransmit(long now, long stallMs) {
+        java.util.List<UnackedSegment> collectStalledRetransmits(long now, long stallMs) {
+            java.util.List<UnackedSegment> batch = new ArrayList<>();
             synchronized (this) {
-                UnackedSegment candidate;
-                boolean fromPending = false;
-                if (!unackedServerData.isEmpty()) {
-                    candidate = unackedServerData.peekFirst();
-                } else if (!pendingQueue.isEmpty()) {
-                    candidate = pendingQueue.peekFirst();
-                    fromPending = true;
-                } else {
-                    return null;
+                if (unackedServerData.isEmpty() && pendingQueue.isEmpty()) {
+                    return batch;
                 }
                 long reference = Math.max(lastAckProgressMs, lastRetransmitMs);
                 if (now - reference < stallMs) {
-                    return null;
+                    return batch;
                 }
                 lastRetransmitMs = now;
                 stalledRetransmitCount++;
-                if (fromPending) {
-                    pendingQueue.pollFirst();
-                    pendingBytes -= candidate.length;
-                    unackedServerData.addLast(candidate);
-                    unackedBytes += candidate.length;
+                if (unackedServerData.isEmpty()) {
+                    // pending 首段从未发出：转登记为在途，随本批写出
+                    UnackedSegment head = pendingQueue.pollFirst();
+                    pendingBytes -= head.length;
+                    unackedServerData.addLast(head);
+                    unackedBytes += head.length;
                 }
-                return candidate;
+                boolean head = true;
+                for (UnackedSegment seg : unackedServerData) {
+                    // 首段无条件重发（零窗口探测）；其后只发窗口装得下的
+                    if (head || fitsInSendWindow(seg.seq, seg.length)) {
+                        batch.add(seg);
+                        head = false;
+                    } else {
+                        break;
+                    }
+                }
             }
+            return batch;
         }
 
         void close() {
