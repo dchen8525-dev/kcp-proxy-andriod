@@ -73,7 +73,12 @@ public class CppRemoteKcpSession {
     // 退回一次性分配。
     private final byte[] kcpRecvBuffer = new byte[KCP_RECV_BUF_SIZE];
 
-    private final AtomicLong lastKeepaliveSentMs = new AtomicLong(0);
+    // 构造时刻即"上次 keepalive"的基准，与 C++ KcpTunnel 构造函数里
+    // last_keepalive_us_.store(now) 同构。若初始化为 0，握手完成的那一刻
+    // (now - 0) 远超 30s 阈值，会在 SOCKS5 应答后立刻多发一个无谓的 keepalive
+    // ——真机日志实测为应答后 3ms，既偏离代码自身"空闲 30s 才发"的语义，也与
+    // C++ 对端行为不一致。
+    private final AtomicLong lastKeepaliveSentMs = new AtomicLong(System.currentTimeMillis());
     private final AtomicLong lastHalfCloseProgressMs = new AtomicLong(0);
 
     private DatagramChannel udpChannel;
