@@ -38,7 +38,12 @@ public class CppRemoteKcpSession {
     private static final int UDP_RECV_BUF_SIZE = 4096;
     private static final int KCP_RECV_BUF_SIZE = 64 * 1024;
     private static final int PENDING_LIMIT_BYTES = 512 * 1024;
-    private static final int SOCKS5_RESPONSE_TIMEOUT_SEC = 10;
+    // HELLO 握手 + SOCKS5 应答的总期限。必须大于服务端的 CONNECT_TIMEOUT_SEC(15s)：
+    // 服务器对连不通的目标会在 15s 后回一个明确的错误码（如 host unreachable），
+    // 本地若先到期，就只能报笼统的 CPP_SERVER_NO_RESPONSE，把服务器的真实诊断
+    // 丢掉——真机实测 IPv6 目标（服务器无 IPv6 出口）时正是如此：10s 本地超时
+    // 抢先，15s 的服务端错误应答永远没机会送达。取 20s = 服务端 15s + 余量。
+    private static final int SOCKS5_RESPONSE_TIMEOUT_SEC = 20;
     // 半关闭宽限（与 C++ CLIENT_HALF_CLOSE_GRACE_SEC = 2 * KCP_TIMEOUT_SEC 一致）：
     // 本地 FIN 后，仅凭送达应用的真实数据续命，排空停滞则回收。
     private static final int HALF_CLOSE_GRACE_MS = 120_000;
