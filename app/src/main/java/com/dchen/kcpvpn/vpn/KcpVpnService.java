@@ -268,20 +268,24 @@ public class KcpVpnService extends VpnService {
 
             // 建立 VPN 接口
             Builder builder = new Builder();
-            // IPv6 也要收进隧道：不通告 ::/0 的话，双栈网络下应用会绕过隧道直连
-            // IPv6 目标（既泄漏真实出口，又让"是否走代理"随地址族而变）。
-            // PacketRouter 对 IPv6 只转发 TCP；UDP（QUIC 等）与 IPv4 上的非 DNS UDP
-            // 一样丢弃，DNS 仍走下面通告的 IPv4 解析器。
+            // 只通告 IPv4（0.0.0.0/0）：C++ 服务器可能没有 IPv6 出口，把 IPv6 也
+            // 收进隧道会让所有 IPv6 目标在服务端 CONNECT 失败（Network is
+            // unreachable），而本地合成的 SYN-ACK 又击穿了应用的 Happy Eyeballs
+            // 回退——用户看到的是 ERR_CONNECTION_RESET 而不是正常的 IPv4 降级。
+            // 不通告 ::/0 后，应用的 IPv6 连接立即因无路由失败，Happy Eyeballs
+            // 正确回退到 IPv4（走隧道）。
+            // 代价：双栈网络下 IPv6 流量绕过隧道直连（隐私泄漏）。如果服务端
+            // 部署了 IPv6，把下面两行 IPv6 配置加回来即可。
             builder.setSession(VpnConfig.VPN_SESSION_NAME)
                     .setMtu(VpnConfig.VPN_MTU)
                     .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
-                    .addAddress(VpnConfig.VPN_ADDRESS_IPV6, VpnConfig.VPN_ADDRESS_PREFIX_IPV6)
+                    // .addAddress(VpnConfig.VPN_ADDRESS_IPV6, VpnConfig.VPN_ADDRESS_PREFIX_IPV6)
                     .addRoute("0.0.0.0", 0)
-                    .addRoute("::", 0)
+                    // .addRoute("::", 0)
                     .addDnsServer("1.1.1.1")
                     .addDnsServer("8.8.8.8")
                     .addDisallowedApplication(getPackageName());
-            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0,::/0 dns=1.1.1.1,8.8.8.8 excludedApp="
+            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 (IPv4 only) dns=1.1.1.1,8.8.8.8 excludedApp="
                     + getPackageName() + " chromeExcluded=false");
 
             vpnInterface = builder.establish();
