@@ -35,3 +35,4 @@ Thumbs.db
 /logcat_output.txt
 /screen_base64.txt
 /ui*.xml
+/window_dump*.xml
