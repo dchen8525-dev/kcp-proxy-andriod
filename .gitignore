@@ -26,3 +26,12 @@ Thumbs.db
 *.log
 # JVM 单元测试用的本地脚手架（无 Android SDK 时用 javac+junit 直接跑 app 的纯 Java 子集）
 .jvmtest/
+
+# Local debugging debris (screenshots, logcat, UI dumps, agent config)
+/.claude/
+/chrome*.png
+/screen*.png
+/dump.xml
+/logcat_output.txt
+/screen_base64.txt
+/ui*.xml

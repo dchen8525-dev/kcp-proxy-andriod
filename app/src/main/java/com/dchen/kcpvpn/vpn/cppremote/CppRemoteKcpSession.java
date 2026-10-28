@@ -172,6 +172,7 @@ public class CppRemoteKcpSession {
                     + connectionId);
             return;
         }
+        boolean overflow = false;
         synchronized (pendingLock) {
             // socks5Done 的判定必须和"排队/直接发"这个动作原子：handleSocks5Response
             // 会在置位后立刻排空队列。若在锁外读 socks5Done，本线程可能在
@@ -184,18 +185,27 @@ public class CppRemoteKcpSession {
             }
             if (!socks5Done) {
                 if (pendingBytes + data.length > PENDING_LIMIT_BYTES) {
-                    Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE pending data overflow connectionId="
-                            + connectionId);
-                    close("SOCKS5_RESPONSE_FAILED");
+                    // Do NOT close() inside the critical section: close() takes
+                    // pendingLock again (to drop the queue) after this fix, and a
+                    // re-entrant call from here would publish the half-built
+                    // state to the close callbacks. Remember the overflow and act
+                    // after releasing the monitor.
+                    overflow = true;
+                } else {
+                    byte[] copy = data.clone();
+                    pendingClientData.add(copy);
+                    pendingBytes += copy.length;
+                    Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE queued TCP payload before SOCKS5 connectionId="
+                            + connectionId + " len=" + data.length);
                     return;
                 }
-                byte[] copy = data.clone();
-                pendingClientData.add(copy);
-                pendingBytes += copy.length;
-                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE queued TCP payload before SOCKS5 connectionId="
-                        + connectionId + " len=" + data.length);
-                return;
             }
+        }
+        if (overflow) {
+            Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE pending data overflow connectionId="
+                    + connectionId);
+            close("SOCKS5_RESPONSE_FAILED");
+            return;
         }
         Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE TCP payload -> KCP raw len=" + data.length
                 + " connectionId=" + connectionId);
@@ -713,6 +723,12 @@ public class CppRemoteKcpSession {
     }
 
     public void close(String reason) {
+        // Reasons that mean "the local side asked for this" rather than "the
+        // remote peer failed". A management-initiated close is NOT evidence that
+        // the C++ server is unreachable, and reporting it as
+        // CPP_REMOTE_FAILED flipped the whole VPN to DISCONNECTED for an
+        // ordinary app-driven reset. Kept next to isGracefulCloseReason() so the
+        // two vocabularies cannot drift.
         if (!closed.compareAndSet(false, true)) {
             return;
         }
@@ -729,8 +745,25 @@ public class CppRemoteKcpSession {
             updateTask = null;
         }
         cancelSocks5ResponseTimeout();
+        // Drop the queued outbound bytes: the session is gone, and holding them
+        // until GC both hides the leak from the queue-depth counter and wastes
+        // up to SEND_QUEUE_LIMIT_BYTES per abandoned tunnel.
+        synchronized (outboundLock) {
+            outboundQueue.clear();
+            outboundBytes = 0;
+        }
+        synchronized (pendingLock) {
+            pendingClientData.clear();
+            pendingBytes = 0;
+        }
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE connection closed reason=" + reason
                 + " connectionId=" + connectionId);
+        // Callbacks run outside every session lock. Both re-enter this object's
+        // collaborators: PacketRouter.handleRemoteConnectionClosed() takes the
+        // TcpConnection monitor and calls remoteManager.sendData(), which calls
+        // back into sendTcpPayload() -> pendingLock; the tunnel manager takes the
+        // session map. Emitting them while holding pendingLock/outboundLock is
+        // how two locks with no other ordering got their cycle.
         if (isRemoteFailure(reason)) {
             remoteStateCallback.onRemoteFailed(reason);
         }
@@ -752,8 +785,30 @@ public class CppRemoteKcpSession {
                 || "duplicate_connection".equals(reason);
     }
 
+    /**
+     * 关闭是否构成"远端不可达"的证据。
+     *
+     * <p>与 {@link #isGracefulCloseReason} 不同：这里判的是"这条关闭能不能证明
+     * C++ 服务器有问题"，而不是"应用该看到 FIN 还是 RST"。普通浏览过程里被
+     * 本地 RST 掉的连接（Chrome 取消一个请求再开新的）是正常寿命终点，把它报成
+     * CPP_REMOTE_FAILED 会把整个 VPN 状态栏从 CONNECTED 翻成 DISCONNECTED，
+     * 这正是"远端状态误导运维"的形态。
+     *
+     * <p>只有真正指向对端的失败才算证据。
+     */
     private static boolean isRemoteFailure(String reason) {
-        return reason != null && !isGracefulCloseReason(reason);
+        if (reason == null) {
+            return false;
+        }
+        switch (reason) {
+            case "tcp_fin":
+            case "tcp_rst":
+            case "manager_stop":
+            case "duplicate_connection":
+                return false;
+            default:
+                return true;
+        }
     }
 
     private void cancelSocks5ResponseTimeout() {

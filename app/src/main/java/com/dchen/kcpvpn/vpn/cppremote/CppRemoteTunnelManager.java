@@ -1,9 +1,11 @@
 package com.dchen.kcpvpn.vpn.cppremote;
 
+import com.dchen.kcpvpn.core.kcp.KcpConfig;
 import com.dchen.kcpvpn.core.session.SocketProtector;
 import com.dchen.kcpvpn.log.LogConfig;
 import com.dchen.kcpvpn.log.Logger;
 
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -59,8 +61,16 @@ public class CppRemoteTunnelManager {
                 + " protocol=socks5-over-kcp-raw-stream socketProtected=true"
                 + " keyLength=" + (key == null ? 0 : key.length())
                 + " crypto=CPP_COMPATIBLE_AES_128_GCM");
-        Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE KCP conv=1 nodelay=1 interval=10"
-                + " resend=5 nc=1 sndWnd=256 rcvWnd=512 mtu=1400 timeout=60s");
+        // 与 C++ kcp_config_line() 逐字同构（字段名与顺序一致），运维直接 diff
+        // 两行就能确认两端参数没有漂移。此前这里是手写字面量
+        // "sndWnd=256 rcvWnd=512"，跟 KcpConfig 的实际取值脱钩：常量改了日志
+        // 不改，日志于是成了谎报——正是本轮对抗分析发现的问题。
+        Logger.info(LogConfig.MODULE_VPN, String.format(Locale.US,
+                "KCP config conv=%d mtu=%d nodelay=%d interval=%d resend=%d nc=%d "
+                        + "sndWnd=%d rcvWnd=%d timeout=%ds",
+                KcpConfig.DEFAULT_CONV, KcpConfig.KCP_MTU, KcpConfig.NODELAY_ENABLED,
+                KcpConfig.KCP_INTERVAL_MS, KcpConfig.NODELAY_RESEND, KcpConfig.NODELAY_NOCWND,
+                KcpConfig.KCP_SNDWND, KcpConfig.KCP_RCVWND, KcpConfig.KCP_TIMEOUT_SEC));
         notifyState(RemoteState.CPP_REMOTE_STARTED, "local VPN/tunnel manager started");
         return true;
     }

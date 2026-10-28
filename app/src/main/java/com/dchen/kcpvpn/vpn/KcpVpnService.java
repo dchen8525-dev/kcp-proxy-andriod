@@ -440,8 +440,19 @@ public class KcpVpnService extends VpnService {
             // 停在"连接中"（旧实现只在 catch 分支里又调了一次）。
             updateNotification();
 
-            // 不重复设 CONNECTED，tunnelManager 的回调已经设过了
-            Logger.info(LogConfig.MODULE_VPN, "LOCAL_VPN_STARTED VPN started successfully");
+            // 状态日志必须区分"本地 VPN 起来了"和"远端服务器可达"，否则
+            // Remote Test 在 C++ 服务端根本没开时也会打出一行看起来成功的
+            // LOCAL_VPN_STARTED，运维无从判断失败发生在哪一级（AGENTS.md §4）。
+            // CPP_REMOTE_REACHABLE 只会在收到 rep=0x00 的合法 SOCKS5 应答后由
+            // CppRemoteTunnelManager 发出，这里绝不替它宣称。
+            if (localMode) {
+                Logger.info(LogConfig.MODULE_VPN, "LOCAL_VPN_STARTED VPN started successfully");
+            } else {
+                Logger.info(LogConfig.MODULE_VPN,
+                        "LOCAL_VPN_STARTED VPN started successfully;"
+                                + " CPP_REMOTE_STARTED awaiting first SOCKS5 response"
+                                + " (CPP_REMOTE_REACHABLE is only logged after rep=0x00)");
+            }
 
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "Start VPN error: " + e.getMessage());
@@ -621,23 +632,39 @@ public class KcpVpnService extends VpnService {
 
         Logger.info(LogConfig.MODULE_VPN, "Closing VPN...");
 
-        // 停止隧道
+        // Every teardown step is isolated: this runs from onDestroy/onRevoke/
+        // stopVpn, and a throw anywhere in the sequence would skip the rest --
+        // leaking the UDP sockets, the schedulers and the TUN fd, and leaving
+        // "VPN closed" never logged. Each step below is independently fatal
+        // only to itself.
         TunnelManager tm = tunnelManager;
         tunnelManager = null;
         if (tm != null) {
-            tm.disconnect();
+            try {
+                tm.disconnect();
+            } catch (RuntimeException e) {
+                Logger.error(LogConfig.MODULE_VPN, "tunnel disconnect failed: " + e);
+            }
         }
         CppRemoteTunnelManager ctm = cppRemoteTunnelManager;
         cppRemoteTunnelManager = null;
         if (ctm != null) {
-            ctm.stop();
+            try {
+                ctm.stop();
+            } catch (RuntimeException e) {
+                Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE manager stop failed: " + e);
+            }
         }
 
-        // 停止路由器
+        // 停止路由器（join 清理线程 + 关闭所有连接）
         PacketRouter pr = packetRouter;
         packetRouter = null;
         if (pr != null) {
-            pr.stop();
+            try {
+                pr.stop();
+            } catch (RuntimeException e) {
+                Logger.error(LogConfig.MODULE_VPN, "PacketRouter stop failed: " + e);
+            }
         }
 
         // 先关闭 VPN 接口，解除 vpnReadThread 的阻塞读
@@ -683,8 +710,14 @@ public class KcpVpnService extends VpnService {
         vpnOutputChannel = null;
         vpnInterface = null;
 
-        // 释放 LocalKcpServer 里那个捕获了本 Service 的静态 SocketProtector
-        LocalKcpServer.clearSocketProtector();
+        // 释放 LocalKcpServer 里那个捕获了本 Service 的静态 SocketProtector。
+        // 这一行必须无条件执行：静态字段持有 Service（及其 Activity）的强引用，
+        // 漏掉就是一个跨进程生命周期的泄漏，绝不是"下次再说"的收尾事项。
+        try {
+            LocalKcpServer.clearSocketProtector();
+        } catch (RuntimeException e) {
+            Logger.error(LogConfig.MODULE_VPN, "clearSocketProtector failed: " + e);
+        }
 
         // 清除保存的参数
         clearSavedParams();

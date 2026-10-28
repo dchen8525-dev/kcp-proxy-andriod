@@ -98,9 +98,25 @@ public class PacketRouter {
 
     public void stop() {
         running = false;
-        if (cleanupThread != null) {
-            cleanupThread.interrupt();
-            cleanupThread = null;
+        // Join the sweeper BEFORE touching the maps it iterates. The old order
+        // (interrupt, then immediately clear) left the sweeper mid-iteration on
+        // connectionsById -- it sleeps in 1s slices, so interrupt() does not
+        // take effect until the sleep returns, and a tick that had already
+        // passed the sleep went on to call sendCloseToOutbound()/onWritePacket()
+        // on connections this method was concurrently closing, and to write to
+        // a VPN interface closeVpn() had already torn down.
+        Thread sweeper = cleanupThread;
+        cleanupThread = null;
+        if (sweeper != null) {
+            sweeper.interrupt();
+            try {
+                // Bounded: the loop only sleeps and does short map work, so it
+                // exits well inside this. A join here is what makes the
+                // clear() below safe rather than a data race.
+                sweeper.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         if (dnsRelayExecutor != null) {
             dnsRelayExecutor.shutdownNow();
@@ -1082,6 +1098,13 @@ public class PacketRouter {
                 try {
                     // 1s 粒度：驱动停滞重传兜底（3s 阈值），也让陈旧回收更及时。
                     Thread.sleep(1000);
+                    // Re-check after the sleep: interrupt() cannot cut a sleep
+                    // short mid-iteration, so a stop() that landed during it
+                    // would otherwise let this pass run against maps stop() is
+                    // clearing and callbacks whose VPN interface is gone.
+                    if (!running) {
+                        break;
+                    }
                     long now = System.currentTimeMillis();
                     for (TcpConnection conn : connectionsById.values()) {
                         // 兜底重传先于回收判定：有未确认在途段时连接是"停滞"而非
