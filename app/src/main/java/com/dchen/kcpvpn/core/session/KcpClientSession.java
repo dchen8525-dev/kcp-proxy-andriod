@@ -44,6 +44,10 @@ public class KcpClientSession {
     private volatile boolean running;
     private volatile boolean connected;
     private final Object handshakeLock = new Object();
+    // close() 的幂等闸门：close 可从 connect 失败、TunnelManager.disconnect、
+    // 背压溢出等多条路径到达，只允许完整执行一次。
+    private final java.util.concurrent.atomic.AtomicBoolean closed =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private final AtomicLong lastPingTime = new AtomicLong(0);
     private final AtomicLong lastPongTime = new AtomicLong(System.currentTimeMillis());
 
@@ -54,6 +58,8 @@ public class KcpClientSession {
 
     private volatile Consumer<KcpFrame> onFrameReceived;
     private volatile SocketProtector socketProtector;
+    // "对端发 FEC 帧"的告警每会话只打一次
+    private boolean fecFrameWarned;
 
     public KcpClientSession(String serverHost, int serverPort, Crypto crypto) {
         this.sessionId = "client-" + System.currentTimeMillis();
@@ -114,6 +120,13 @@ public class KcpClientSession {
                 throw new IOException("missing SocketProtector for kcp udp socket");
             }
 
+            // disconnect 可能与 connect 并发：close() 已在 protect 期间先到的话，
+            // socket 已被它关闭，这里绝不能再拉起线程（否则会话带着 running=true
+            // 复活，而 close 已被一次性闸门消费，再没人能关掉它）。
+            if (closed.get()) {
+                return false;
+            }
+
             running = true;
             connected = false;
             touchActivity();
@@ -142,7 +155,7 @@ public class KcpClientSession {
 
             Logger.info(LogConfig.MODULE_KCP_CLIENT, "Connected to " + serverAddr);
             return true;
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             Logger.error(LogConfig.MODULE_KCP_CLIENT, "Connect error: " + e.getMessage());
             close();
             return false;
@@ -204,6 +217,16 @@ public class KcpClientSession {
                 ret = kcp.input(decrypted);
             }
             if (ret < 0) {
+                // 与 C++ kcp_tunnel.cpp 同判：被拒报文解出来是 FEC 封帧 → 对端
+                // FEC 配置与本端不匹配（配置问题，不是密钥损坏），每会话只告警一次。
+                if (!fecFrameWarned
+                        && com.dchen.kcpvpn.core.protocol.FecFraming.looksLikeFecFrame(
+                                decrypted, decrypted.length)) {
+                    fecFrameWarned = true;
+                    Logger.warning(LogConfig.MODULE_KCP_CLIENT,
+                            "peer is sending FEC-framed datagrams but local side has no FEC "
+                                    + "(match the FEC DATA:PARITY setting on both ends)");
+                }
                 Logger.warning(LogConfig.MODULE_KCP_CLIENT, "ikcp_input rejected packet, ret=" + ret);
                 return;
             }
@@ -411,7 +434,10 @@ public class KcpClientSession {
     }
 
     public synchronized void close() {
-        if (!running) {
+        // 用 closed 而不是 running 做幂等闸门：connect() 在 protect 失败等
+        // running=true 之前的异常路径也会调 close()，旧的 !running 早退会让
+        // 已创建的 UDP socket 永不关闭（fd 泄漏）。
+        if (!closed.compareAndSet(false, true)) {
             return;
         }
         running = false;

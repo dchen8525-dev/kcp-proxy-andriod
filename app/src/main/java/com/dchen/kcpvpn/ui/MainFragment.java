@@ -1,14 +1,8 @@
 package com.dchen.kcpvpn.ui;
 
-import androidx.activity.result.ActivityResultLauncher;
-import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.core.content.ContextCompat;
-import androidx.fragment.app.Fragment;
-import androidx.lifecycle.ViewModelProvider;
-
 import android.Manifest;
-import android.content.pm.PackageManager;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.LayoutInflater;
@@ -16,8 +10,11 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.LinearLayout;
 import android.widget.TextView;
-
-import java.util.Locale;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.core.content.ContextCompat;
+import androidx.fragment.app.Fragment;
+import androidx.lifecycle.ViewModelProvider;
 
 import com.dchen.kcpvpn.R;
 import com.dchen.kcpvpn.data.config.VpnStartConfig;
@@ -30,6 +27,8 @@ import com.google.android.material.button.MaterialButton;
 import com.google.android.material.button.MaterialButtonToggleGroup;
 import com.google.android.material.snackbar.Snackbar;
 import com.google.android.material.textfield.TextInputEditText;
+
+import java.util.Locale;
 
 /**
  * 主界面 Fragment
@@ -73,7 +72,8 @@ public class MainFragment extends Fragment {
     private ActivityResultLauncher<Intent> vpnAuthLauncher;
     private ActivityResultLauncher<String> notificationPermissionLauncher;
 
-    private final MaterialButtonToggleGroup.OnButtonCheckedListener modeChangeListener = (group, checkedId, isChecked) -> {
+    private final MaterialButtonToggleGroup.OnButtonCheckedListener modeChangeListener =
+            (group, checkedId, isChecked) -> {
         if (isChecked) {
             if (checkedId == R.id.btn_remote_mode) {
                 viewModel.setMode(MainViewModel.Mode.REMOTE);
@@ -115,7 +115,8 @@ public class MainFragment extends Fragment {
                         requestVpnAuthorizationOrStart();
                     } else {
                         Logger.warning(LogConfig.MODULE_UI, "Notification permission denied");
-                        viewModel.setErrorMessage("NOTIFICATION_PERMISSION_DENIED: 通知权限被拒绝。建议：允许通知后再启动 VPN，确保前台服务状态可见。");
+                        viewModel.setErrorMessage(
+                                "NOTIFICATION_PERMISSION_DENIED: 通知权限被拒绝。建议：允许通知后再启动 VPN，确保前台服务状态可见。");
                         btnConnect.setEnabled(true);
                     }
                 });
@@ -231,8 +232,8 @@ public class MainFragment extends Fragment {
      * 设置监听器
      */
     private void setupListeners() {
-        // 模式切换
-        modeToggleGroup.addOnButtonCheckedListener(modeChangeListener);
+        // 模式切换监听器由 onViewCreated 统一注册（先恢复选中态再挂监听器），
+        // 这里不能重复 add，否则每次切换回调执行两遍。
 
         // 启动本地服务
         btnStartLocalServer.setOnClickListener(v -> {

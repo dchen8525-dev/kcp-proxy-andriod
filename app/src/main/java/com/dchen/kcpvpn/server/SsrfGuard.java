@@ -1,8 +1,8 @@
 package com.dchen.kcpvpn.server;
 
-import java.net.InetAddress;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
+import java.net.InetAddress;
 
 /**
  * SSRF 目标防护 - C++ address.cpp is_restricted_target 的 Java 移植。

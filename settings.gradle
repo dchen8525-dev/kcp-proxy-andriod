@@ -12,6 +12,9 @@ plugins {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        // mavenLocal 供 aapt2 原生二进制等本地手工安装的工件使用；列在首位，
+        // 其余依赖仍走 google()/mavenCentral()。
+        mavenLocal()
         google()
         mavenCentral()
     }

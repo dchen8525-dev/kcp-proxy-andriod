@@ -8,9 +8,6 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 
 import com.dchen.kcpvpn.core.session.SocketProtector;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-
 import java.io.ByteArrayOutputStream;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -21,6 +18,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+
+import org.junit.Test;
+import org.junit.runner.RunWith;
 
 /**
  * 真机互操作测试：在设备上跑 Android 的 CPP_REMOTE 协议栈（CppRemoteKcpSession +

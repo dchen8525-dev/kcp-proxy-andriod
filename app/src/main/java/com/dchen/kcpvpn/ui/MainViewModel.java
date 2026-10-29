@@ -1,12 +1,11 @@
 package com.dchen.kcpvpn.ui;
 
-import androidx.lifecycle.AndroidViewModel;
-import androidx.lifecycle.LiveData;
-import androidx.lifecycle.MutableLiveData;
-
 import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
+import androidx.lifecycle.AndroidViewModel;
+import androidx.lifecycle.LiveData;
+import androidx.lifecycle.MutableLiveData;
 
 import com.dchen.kcpvpn.log.LogConfig;
 import com.dchen.kcpvpn.log.Logger;
@@ -51,7 +50,8 @@ public class MainViewModel extends AndroidViewModel {
     }
 
     private final MutableLiveData<Mode> mode = new MutableLiveData<>(Mode.REMOTE);
-    private final MutableLiveData<VpnConnectionState> connectionState = new MutableLiveData<>(VpnConnectionState.DISCONNECTED);
+    private final MutableLiveData<VpnConnectionState> connectionState =
+            new MutableLiveData<>(VpnConnectionState.DISCONNECTED);
     private final MutableLiveData<Long> duration = new MutableLiveData<>(0L);
     private final MutableLiveData<Long> uploadBytes = new MutableLiveData<>(0L);
     private final MutableLiveData<Long> downloadBytes = new MutableLiveData<>(0L);

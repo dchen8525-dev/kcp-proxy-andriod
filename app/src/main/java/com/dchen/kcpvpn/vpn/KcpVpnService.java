@@ -10,7 +10,6 @@ import android.content.SharedPreferences;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
-
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.dchen.kcpvpn.R;
@@ -55,6 +54,12 @@ public class KcpVpnService extends VpnService {
     private Thread healthCheckThread;
     // closeVpn 可被 onDestroy / onRevoke / stopVpn 三处并发调用，用它保证只真正执行一次。
     private boolean vpnClosed;
+    // closeVpn 每次真正执行都自增。startVpn 用它检测"启动流程进行期间落入了 stop
+    // 请求"：stopVpn 的 closeVpn 可能插在 startVpn 的两个装配步骤之间（startVpn
+    // 不持有 this 锁），把当时已赋值的字段拆掉，而 startVpn 随后又装配出新的对象。
+    // 启动完成后校验 epoch，变了就补一次完整清理，保证"用户要停就一定停干净"。
+    private final java.util.concurrent.atomic.AtomicInteger closeEpoch =
+            new java.util.concurrent.atomic.AtomicInteger(0);
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile VpnConnectionState connectionState;
@@ -255,9 +260,14 @@ public class KcpVpnService extends VpnService {
         Logger.info(LogConfig.MODULE_VPN, "startVpn() begin");
 
         // 同一实例可能被 onStartCommand 多次拉起，重置 closeVpn 的一次性标志。
+        // 该同步块同时保证：任何在此刻之前开始执行的 closeVpn 已经完整退出
+        // （closeVpn 全程持有 this 锁），不会与新启动的装配交错。
         synchronized (this) {
             vpnClosed = false;
         }
+        // 必须在同步块之后取：此后任何新的 closeVpn 都会自增 epoch，启动完成时
+        // 的校验据此发现"装配期间落入了 stop"。
+        final int startEpoch = closeEpoch.get();
 
         connectionState = VpnConnectionState.CONNECTING;
         broadcastState();
@@ -333,9 +343,11 @@ public class KcpVpnService extends VpnService {
 
                 @Override
                 public void bindToNetwork(java.net.Socket socket) throws java.io.IOException {
-                    android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                    android.net.ConnectivityManager cm =
+                            (android.net.ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
                     if (cm == null) {
-                        Logger.warning(LogConfig.MODULE_VPN, "ConnectivityManager is null, cannot bind socket to network");
+                        Logger.warning(LogConfig.MODULE_VPN,
+                                "ConnectivityManager is null, cannot bind socket to network");
                         return;
                     }
                     android.net.Network[] networks = cm.getAllNetworks();
@@ -440,6 +452,19 @@ public class KcpVpnService extends VpnService {
             // 停在"连接中"（旧实现只在 catch 分支里又调了一次）。
             updateNotification();
 
+            // 启动全程未持锁，stopVpn/onRevoke 的 closeVpn 可能插在任意两步之间。
+            // epoch 变了说明有 stop 落在装配期间：closeVpn 只拆掉了它当时看到的
+            // 半成品，我们随后装配的对象还活着。补一次完整清理，确保停干净。
+            if (closeEpoch.get() != startEpoch) {
+                Logger.warning(LogConfig.MODULE_VPN,
+                        "Stop request landed during VPN startup; completing teardown");
+                synchronized (this) {
+                    vpnClosed = false;
+                }
+                closeVpn();
+                return;
+            }
+
             // 状态日志必须区分"本地 VPN 起来了"和"远端服务器可达"，否则
             // Remote Test 在 C++ 服务端根本没开时也会打出一行看起来成功的
             // LOCAL_VPN_STARTED，运维无从判断失败发生在哪一级（AGENTS.md §4）。
@@ -511,7 +536,8 @@ public class KcpVpnService extends VpnService {
                                             writeToVpn(responsePacket);
                                             downloadBytes.addAndGet(responsePacket.length);
                                         } catch (IOException e) {
-                                            Logger.error(LogConfig.MODULE_VPN, "VPN write-back error: " + e.getMessage());
+                                            Logger.error(LogConfig.MODULE_VPN,
+                                                    "VPN write-back error: " + e.getMessage());
                                         }
                                     }
                                 });
@@ -627,6 +653,7 @@ public class KcpVpnService extends VpnService {
             return;
         }
         vpnClosed = true;
+        closeEpoch.incrementAndGet();
 
         running.set(false);
 

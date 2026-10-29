@@ -1,10 +1,11 @@
 package com.dchen.kcpvpn.vpn.cppremote;
 
-import com.dchen.kcpvpn.core.kcp.KcpConfig;
-import org.junit.Test;
-
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+
+import com.dchen.kcpvpn.core.kcp.KcpConfig;
+
+import org.junit.Test;
 
 /**
  * 出站背压判据：KCP 发送队列到阈值就排队，且阈值必须给整条消息的分片留出空间，

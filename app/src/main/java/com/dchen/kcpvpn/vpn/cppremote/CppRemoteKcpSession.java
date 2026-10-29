@@ -4,6 +4,7 @@ import com.dchen.kcpvpn.core.crypto.Crypto;
 import com.dchen.kcpvpn.core.crypto.CryptoConfig;
 import com.dchen.kcpvpn.core.kcp.Kcp;
 import com.dchen.kcpvpn.core.kcp.KcpConfig;
+import com.dchen.kcpvpn.core.protocol.FecFraming;
 import com.dchen.kcpvpn.core.session.SessionConfig;
 import com.dchen.kcpvpn.core.session.SocketProtector;
 import com.dchen.kcpvpn.log.LogConfig;
@@ -35,7 +36,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *   而不是立即拆除会话。
  */
 public class CppRemoteKcpSession {
-    private static final int UDP_RECV_BUF_SIZE = 4096;
+    // 必须容得下一条完整 UDP 报文：内核对装不下的数据报是静默截断，AEAD tag
+    // 永远验不过，隧道表现为"握手正常但零流量"。旧值 4096 在对端 --mtu 调到
+    // ~4KB 以上时正是这个死法（C++ 0.3.2 d5bfa44 修复的同一缺陷）；接收方无法
+    // 预知对端 MTU，按合法上限推导（见 SessionConfig.UDP_WIRE_DATAGRAM_MAX）。
+    private static final int UDP_RECV_BUF_SIZE = SessionConfig.UDP_WIRE_DATAGRAM_MAX;
     private static final int KCP_RECV_BUF_SIZE = 64 * 1024;
     private static final int PENDING_LIMIT_BYTES = 512 * 1024;
     // HELLO 握手 + SOCKS5 应答的总期限。必须大于服务端的 CONNECT_TIMEOUT_SEC(15s)：
@@ -70,6 +75,13 @@ public class CppRemoteKcpSession {
     private final Queue<byte[]> pendingClientData = new ArrayDeque<>();
     private final Queue<byte[]> outboundQueue = new ArrayDeque<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    // 锁内路径（writeThroughKcp/handleKcpOutput 在 outboundLock+kcpLock 下）探测到
+    // 不可恢复故障时只在这里登记原因，等持锁方退出临界区后再由 closeIfRequested()
+    // 真正执行 close()。close() 自己要拿 pendingLock 清排队数据，若在持有
+    // outboundLock 时直接调，与更新线程 flushPendingClientData 的
+    // pendingLock→outboundLock 路径构成锁环，会死锁。
+    private final java.util.concurrent.atomic.AtomicReference<String> pendingCloseReason =
+            new java.util.concurrent.atomic.AtomicReference<>();
     private final CppSocks5ResponseBuffer socks5ResponseBuffer = new CppSocks5ResponseBuffer();
     private final ByteBuffer udpRecvBuffer = ByteBuffer.allocate(UDP_RECV_BUF_SIZE);
     // KCP 接收复用缓冲：每条消息临时 new max(peek, 64KB) 在高吞吐下是每秒几十
@@ -102,6 +114,8 @@ public class CppRemoteKcpSession {
     private int authFailures;
     private int pendingBytes;
     private int outboundBytes;
+    // "对端发 FEC 帧"的告警每会话只打一次（FecFraming.looksLikeFecFrame 的消费方）
+    private boolean fecFrameWarned;
 
     public CppRemoteKcpSession(long connectionId, String serverHost, int serverPort, String key,
                                byte[] dstAddr, int dstPort, SocketProtector socketProtector,
@@ -266,6 +280,9 @@ public class CppRemoteKcpSession {
                     kcp.flush();
                     alive = kcp.isAlive();
                 }
+                // kcp.flush → handleKcpOutput 可能已在 kcpLock 内登记了关闭请求
+                // （UDP 发送失败/计数器溢出）。锁已释放，这里安全地执行。
+                closeIfRequested();
                 if (!alive) {
                     // KCP 死链（某段重传超过 dead_link 次，state=-1）。必须在这里
                     // 主动回收：空闲连接两边都没有数据，dead_link 靠 maybeSendKeepalive
@@ -377,6 +394,17 @@ public class CppRemoteKcpSession {
                 ret = kcp.input(decrypted);
             }
             if (ret < 0) {
+                // 与 C++ kcp_tunnel.cpp 同判：被拒报文若解出来是 FEC 封帧，说明
+                // 对端开了 --fec 而本端不支持/未开启——这是配置不匹配，不是密钥
+                // 或协议损坏。每会话只打一次，避免刷屏。
+                if (!fecFrameWarned && FecFraming.looksLikeFecFrame(decrypted, decrypted.length)) {
+                    fecFrameWarned = true;
+                    Logger.warning(LogConfig.MODULE_VPN,
+                            "CPP_REMOTE peer is sending FEC-framed datagrams but local side has "
+                                    + "no FEC (enable FEC on the local side with the SAME "
+                                    + "DATA:PARITY, or disable it on the peer) connectionId="
+                                    + connectionId);
+                }
                 Logger.warning(LogConfig.MODULE_VPN, "CPP_REMOTE ikcp_input rejected connectionId="
                         + connectionId + " ret=" + ret);
                 return;
@@ -620,23 +648,30 @@ public class CppRemoteKcpSession {
         if (!running || data == null || data.length == 0) {
             return;
         }
-        boolean overflow;
-        int queuedBytes;
+        boolean overflow = false;
+        int queuedBytes = 0;
+        boolean wroteDirect = false;
         synchronized (outboundLock) {
             // 只有队列为空且 KCP 尚有余量才能直接写入；队列非空时必须继续排队，
-            // 否则新字节会插到已排队数据前面，打乱 KCP 字节流。
+            // 否则新字节会插到已排队数据前面，打乱 KCP 字节流顺序。
             if (outboundQueue.isEmpty() && hasSendCapacity(waitSend())) {
                 writeThroughKcp(data);
-                return;
+                wroteDirect = true;
+            } else {
+                overflow = outboundBytes + data.length > SEND_QUEUE_LIMIT_BYTES;
+                queuedBytes = outboundBytes;
+                if (!overflow) {
+                    outboundQueue.add(data);
+                    outboundBytes += data.length;
+                    Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE outbound queued by backpressure connectionId="
+                            + connectionId + " len=" + data.length + " queuedBytes=" + outboundBytes);
+                }
             }
-            overflow = outboundBytes + data.length > SEND_QUEUE_LIMIT_BYTES;
-            queuedBytes = outboundBytes;
-            if (!overflow) {
-                outboundQueue.add(data);
-                outboundBytes += data.length;
-                Logger.debug(LogConfig.MODULE_VPN, "CPP_REMOTE outbound queued by backpressure connectionId="
-                        + connectionId + " len=" + data.length + " queuedBytes=" + outboundBytes);
-            }
+        }
+        // writeThroughKcp 失败时只在锁内登记了关闭请求；这里已出临界区，安全执行
+        if (wroteDirect) {
+            closeIfRequested();
+            return;
         }
         if (overflow) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE KCP_BACKPRESSURE_OVERFLOW connectionId="
@@ -667,6 +702,8 @@ public class CppRemoteKcpSession {
                 outboundBytes -= next.length;
                 writeThroughKcp(next);
             }
+            // writeThroughKcp 失败时只登记了请求；出临界区后再执行 close()
+            closeIfRequested();
         }
     }
 
@@ -685,11 +722,25 @@ public class CppRemoteKcpSession {
             if (ret < 0) {
                 Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE ikcp_send failed connectionId="
                         + connectionId + " ret=" + ret + " len=" + data.length);
-                close("KCP_SESSION_FAILED");
+                // 只登记，锁外再关（见 requestClose 注释）
+                requestClose("KCP_SESSION_FAILED");
                 return;
             }
             kcp.update((int) (System.currentTimeMillis() & 0xFFFFFFFFL));
             kcp.flush();
+        }
+    }
+
+    /** 锁内路径登记关闭请求；真正的 close() 由持锁方退出临界区后执行。 */
+    private void requestClose(String reason) {
+        pendingCloseReason.compareAndSet(null, reason);
+    }
+
+    /** 有登记的关闭请求就执行（必须在所有会话锁之外调用）。 */
+    private void closeIfRequested() {
+        String reason = pendingCloseReason.get();
+        if (reason != null && !closed.get()) {
+            close(reason);
         }
     }
 
@@ -707,14 +758,16 @@ public class CppRemoteKcpSession {
                     + " len=" + encrypted.length + " connectionId=" + connectionId);
         } catch (Crypto.CounterOverflowException e) {
             // 计数器达到 2^48：此后每个加密都会失败，会话已无法续用，立即拆除。
-            // 单独捕获，关闭原因不与普通 UDP 发送失败混在一起。
+            // 单独捕获，关闭原因不与普通 UDP 发送失败混在一起。只登记不直接关：
+            // 本方法在 kcp.flush 的回调里执行，调用方还持有 kcpLock（可能连同
+            // outboundLock），close() 要拿 pendingLock，会成环。
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE crypto counter overflow connectionId="
                     + connectionId + " error=" + e.getMessage());
-            close("CRYPTO_COUNTER_OVERFLOW");
+            requestClose("CRYPTO_COUNTER_OVERFLOW");
         } catch (Exception e) {
             Logger.error(LogConfig.MODULE_VPN, "CPP_REMOTE UDP_SEND_FAILED connectionId="
                     + connectionId + " error=" + e.getMessage());
-            close("UDP_SEND_FAILED");
+            requestClose("UDP_SEND_FAILED");
         }
     }
 

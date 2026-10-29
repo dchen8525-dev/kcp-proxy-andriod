@@ -1,12 +1,12 @@
 package com.dchen.kcpvpn.core.crypto;
 
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 import javax.crypto.Cipher;
 import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
-import java.security.InvalidAlgorithmParameterException;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
 
 /**
  * AES-128-GCM 加密器 - 与 C++ crypto.cpp 一致
@@ -43,7 +43,11 @@ public class AesGcmCipher {
      * @param nonce 12字节 Nonce
      * @return 密文 + 16字节认证标签
      */
-    public byte[] encrypt(byte[] plaintext, byte[] nonce) {
+    // javax.crypto.Cipher 实例是有状态的（init/doFinal 互相依赖），文档明确
+    // 非线程安全。当前调用方都在 Crypto.stateLock 内串行使用本类，但那是"恰好
+    // 安全"而不是"设计安全"——方法级同步把线程安全契约固化到类自身，未来的
+    // 调用方共享实例时不会再得到交错的 GCM 状态。
+    public synchronized byte[] encrypt(byte[] plaintext, byte[] nonce) {
         if (nonce == null || nonce.length != CryptoConfig.NONCE_SIZE) {
             throw new IllegalArgumentException("Nonce must be 12 bytes");
         }
@@ -63,7 +67,7 @@ public class AesGcmCipher {
      * @param nonce 12字节 Nonce
      * @return 明文数据
      */
-    public byte[] decrypt(byte[] ciphertext, byte[] nonce) {
+    public synchronized byte[] decrypt(byte[] ciphertext, byte[] nonce) {
         if (nonce == null || nonce.length != CryptoConfig.NONCE_SIZE) {
             throw new IllegalArgumentException("Nonce must be 12 bytes");
         }

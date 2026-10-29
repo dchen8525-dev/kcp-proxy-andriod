@@ -31,6 +31,11 @@ public class ServerConfig {
     // 存活等待客户端收尾，但不能无限期占用目标 socket。
     public static final int HALF_CLOSE_IDLE_MS = 150 * 1000;
 
+    // UDP 中继并发上限：每条中继一个线程 + 一个 socket，本地模式放行全部 UDP
+    // （不只 DNS）。不给上限的话，恶意应用用随机源端口刷 UDP 帧就能制造无界的
+    // 线程/fd 增长。超过即拒绝新建中继。
+    public static final int MAX_UDP_RELAYS = 256;
+
     // 背压控制阈值
     public static final int BACKPRESSURE_THRESHOLD = KcpConfig.KCP_BACKPRESSURE_THRESHOLD;
 

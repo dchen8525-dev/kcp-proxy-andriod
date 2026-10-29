@@ -6,6 +6,28 @@ Build and unit test:
 ./gradlew clean assembleDebug test lintDebug
 ```
 
+## Running tests without an Android SDK
+
+Two fallbacks exist for machines where the Google SDK repositories are unreachable
+(verified working on the current dev box):
+
+1. **Assemble an SDK from a mirror.** Tencent mirrors the SDK packages at
+   `https://mirrors.cloud.tencent.com/AndroidSDK/` (e.g. `platform-34-ext7_r02.zip`,
+   `build-tools_r34-windows.zip`, `platform-tools_r34.0.5-windows.zip`). Unzip them into
+   `%LOCALAPPDATA%\Android\Sdk` as `platforms/android-34`, `build-tools/34.0.0`,
+   `platform-tools`, write the standard license hashes into `licenses/android-sdk-license`,
+   and install the aapt2 binary artifact (from the Aliyun google mirror,
+   `com.android.tools.build:aapt2:<agp>-<build>:windows`) into `~/.m2` — the project's
+   `settings.gradle` already checks `mavenLocal()` first. `app/build.gradle` pins
+   `buildToolsVersion "34.0.0"` so AGP does not demand a build-tools version the mirror
+   does not have.
+
+2. **Pure-JVM harness** (no Android at all): `.jvmtest/run.sh` compiles the pure-Java
+   subset of main sources with the stub `Logger` in `.jvmtest/stub/` and runs every
+   plain-JVM unit test with JUnit 4. Covers crypto, KCP, protocol codecs, config, the
+   local server and `PacketRouter`/tunnel logic — everything except code that imports
+   `android.*` directly.
+
 ## Unit test coverage
 
 | Test | What it pins down |

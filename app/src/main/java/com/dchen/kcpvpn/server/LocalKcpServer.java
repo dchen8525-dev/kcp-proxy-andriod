@@ -16,8 +16,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -160,7 +160,9 @@ public class LocalKcpServer {
         recvThread.start();
     }
 
-    private void handleReceive(InetSocketAddress clientAddr, byte[] encryptedData) {
+    // 包级可见：单测直接驱动本方法复现 C++ 0.3.1 e3eff1d 的驱逐场景
+    // （陈旧握手重传不得驱逐活会话），不必经过真实 socket。
+    void handleReceive(InetSocketAddress clientAddr, byte[] encryptedData) {
         String sessionId = clientAddr.getAddress().getHostAddress() + ":" + clientAddr.getPort();
 
         ServerSession session = sessions.get(sessionId);
@@ -170,6 +172,11 @@ public class LocalKcpServer {
             // 先按新会话认证，认证通过才整体替换；直接丢弃异 salt 的伪造包，
             // 否则任何错误密钥的报文都能拆掉正在使用的会话。
             // 替换会释放一个名额，因此满员时仍要允许这条路径。
+            // 驱逐顺序是 C++ 0.3.1 e3eff1d 修过的缺陷，这里必须保持"候选会话
+            // 通过 认证→salt 查重→墓碑检查 全部关卡（createSession 返回非 null）
+            // 之后"才 closeSession 旧会话：旧隧道的陈旧握手重传（其 salt 在首次
+            // 接受时已入墓碑）会走到墓碑检查被拒，活会话原样存活。若先驱逐后查，
+            // 端点上就会既丢了活会话、又拒绝重传包，隧道瘫到 600s TTL 过期。
             if (isAuthThrottled(sessionId)) {
                 return;
             }
@@ -264,6 +271,14 @@ public class LocalKcpServer {
     /**
      * @param replacingExisting true 表示这是在替换同端口的旧会话（客户端重连复用临时端口），
      *                          旧会话随即释放名额，故满员时仍应允许。
+     *
+     * <p>每个候选会话都构造全新的 {@link Crypto}，任何一步失败（方向字节、计数器
+     * 越界、AEAD tag）就地丢弃整个实例——解密路径"先学 salt 后认证"留下的毒化状态
+     * （saltSet=true + 攻击者盐派生的密钥）随之消亡，不会影响后续候选。这与
+     * C++ 0.3.2 3133a1c 的 salt-learning 回滚同语义：C++ 用 forget_learned_salt()
+     * 显式回滚，Java 用"每候选一实例、失败即弃"达到同一隔离；Crypto 侧 PSK 派生
+     * 后即擦除且拒绝再派生（pendingPsk 置空后 !saltSet 分支直接抛 ISE），两个前提
+     * 这里都成立。
      */
     private ServerSession createSession(InetSocketAddress clientAddr, byte[] encryptedPacket,
                                         boolean replacingExisting) {
@@ -385,11 +400,24 @@ public class LocalKcpServer {
             String key = udpRelayKey(session.getSessionId(), datagram, remoteServer);
             UdpRelay relay = udpRelays.get(key);
             if (relay == null) {
+                // 中继总量上限：每条中继一个线程 + 一个 socket，本地模式放行全部
+                // UDP（不只 DNS）。恶意应用用随机源端口刷 UDP 帧可制造无界的
+                // 线程/fd 增长，超限即丢弃新中继（已有中继不受影响）。
+                if (udpRelays.size() >= ServerConfig.MAX_UDP_RELAYS) {
+                    Logger.warning(LogConfig.MODULE_KCP_SERVER, "UDP relay cap reached ("
+                            + ServerConfig.MAX_UDP_RELAYS + "), dropping new relay");
+                    return;
+                }
                 UdpRelay created = new UdpRelay(key, session, datagram, remoteServer);
                 UdpRelay existing = udpRelays.putIfAbsent(key, created);
                 relay = existing == null ? created : existing;
                 if (existing == null) {
                     relay.start();
+                } else {
+                    // putIfAbsent 落败：created 的 socket 已打开但永远不会被启动，
+                    // 不关闭就是 fd 泄漏（两个 dnsExecutor 线程同时为同一 5 元组
+                    // 建中继即触发）。
+                    created.close();
                 }
             }
             relay.send(datagram.payload);
@@ -576,9 +604,9 @@ public class LocalKcpServer {
     }
 
     public void stop() {
-        if (!running) {
-            return;
-        }
+        // 不以 running 作为早退闸门：从未 start() 的实例（单测直接驱动
+        // handleReceive 的路径）也会创建会话线程，必须能拆掉。余下每一步都
+        // 对 null/空集安全，重复调用无副作用。
         running = false;
 
         Logger.info(LogConfig.MODULE_KCP_SERVER, "Server stopping...");
@@ -648,21 +676,28 @@ public class LocalKcpServer {
             this.remotePort = datagram.dstPort;
             this.remoteAddr = remoteAddr;
             this.socket = new DatagramSocket();
-            this.socket.setSoTimeout(1000);
-            SocketProtector protector = socketProtector;
-            if (protector != null) {
-                boolean protectedOk = protector.protect(socket);
-                if (remotePort == 53) {
-                    Logger.info(LogConfig.MODULE_KCP_SERVER, "protect dns udp socket=" + protectedOk);
+            try {
+                this.socket.setSoTimeout(1000);
+                SocketProtector protector = socketProtector;
+                if (protector != null) {
+                    boolean protectedOk = protector.protect(socket);
+                    if (remotePort == 53) {
+                        Logger.info(LogConfig.MODULE_KCP_SERVER, "protect dns udp socket=" + protectedOk);
+                    } else {
+                        Logger.debug(LogConfig.MODULE_KCP_SERVER, "protect remote udp socket=" + protectedOk
+                                + " dst=" + remoteAddr.getHostAddress() + ":" + remotePort);
+                    }
+                    if (!protectedOk) {
+                        throw new IOException("protect udp relay socket failed");
+                    }
                 } else {
-                    Logger.debug(LogConfig.MODULE_KCP_SERVER, "protect remote udp socket=" + protectedOk
-                            + " dst=" + remoteAddr.getHostAddress() + ":" + remotePort);
+                    throw new IOException("missing SocketProtector for udp relay socket");
                 }
-                if (!protectedOk) {
-                    throw new IOException("protect udp relay socket failed");
-                }
-            } else {
-                throw new IOException("missing SocketProtector for udp relay socket");
+            } catch (IOException e) {
+                // protect 失败的抛出路径不能把已打开的 socket 带走：调用方只看到
+                // 异常，没人再拿得到这个实例的引用，fd 就泄漏了。
+                socket.close();
+                throw e;
             }
             this.closed = new AtomicBoolean(false);
             this.lastActivityTime = System.currentTimeMillis();
@@ -712,7 +747,10 @@ public class LocalKcpServer {
                 }
             } finally {
                 close();
-                udpRelays.remove(key);
+                // 必须按 (key, 实例) 删除：只按 key 删会把"旧中继刚退出、同 key
+                // 的新中继刚被建起"的后者误摘出映射——此后同 key 的数据报会再建
+                // 一条重复中继，客户端收到双份响应。
+                udpRelays.remove(key, this);
             }
         }
 

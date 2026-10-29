@@ -1,9 +1,10 @@
 package com.dchen.kcpvpn.vpn;
 
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
 import com.dchen.kcpvpn.core.protocol.KcpFrame;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
 
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
@@ -12,9 +13,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
 
 /**
  * IPv6 转发：解析 40 字节头、合成 IPv6 SYN-ACK、TCP 伪首部校验和、扩展头/分片丢弃。

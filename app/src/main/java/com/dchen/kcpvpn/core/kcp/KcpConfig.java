@@ -21,6 +21,10 @@ public class KcpConfig {
     public static final int KCP_SNDWND = 1024;
     public static final int KCP_RCVWND = 1024;
     public static final int KCP_MTU = 1400;
+    // 对端 --mtu 的合法上限（C++ config.hpp KCP_MTU_MAX）：本端发送/接收 MTU 是
+    // 自己的配置，但对端可以把 --mtu 配到 9000，接收缓冲必须按整个合法范围留量
+    // （见 SessionConfig.UDP_WIRE_DATAGRAM_MAX）。
+    public static final int KCP_MTU_MAX = 9000;
     public static final int KCP_TIMEOUT_SEC = 60;
     public static final int RECONNECT_DELAY_SEC = 2;
 

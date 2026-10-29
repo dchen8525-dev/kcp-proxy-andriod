@@ -4,10 +4,10 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
-import org.junit.Test;
-
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+
+import org.junit.Test;
 
 /**
  * HKDF-SHA256 对照测试：期望值由独立实现（Node.js crypto.hkdfSync、RFC 5869 官方向量）生成，

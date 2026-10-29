@@ -1,9 +1,9 @@
 package com.dchen.kcpvpn.core.kcp;
 
-import org.junit.Test;
-
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+
+import org.junit.Test;
 
 /**
  * ikcp_send 的分片数上限：frg 在线上只有 1 字节，count >= 255 必须拒绝——

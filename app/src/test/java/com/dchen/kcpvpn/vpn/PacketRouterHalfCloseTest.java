@@ -1,9 +1,9 @@
 package com.dchen.kcpvpn.vpn;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
 import com.dchen.kcpvpn.core.protocol.KcpFrame;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -11,8 +11,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
 
 /**
  * 半关闭时序：本地 FIN 只回 ACK 并保留会话，我们的 FIN 只在远端关闭时发出一次。

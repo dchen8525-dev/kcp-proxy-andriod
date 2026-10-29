@@ -1,0 +1,23 @@
+# 代码库统一风格（.jvmtest/format.py 与本文件保持同一套规则）
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{java,gradle}]
+indent_size = 4
+max_line_length = 120
+
+[*.{xml,pro,cfg,properties}]
+indent_size = 4
+
+[*.md]
+# Markdown 的行尾双空格是硬换行语法，保留
+trim_trailing_whitespace = false
+
+[*.{bat,cmd}]
+end_of_line = crlf

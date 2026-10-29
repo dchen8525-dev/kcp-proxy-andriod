@@ -7,12 +7,12 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import org.junit.Test;
-
-import javax.crypto.AEADBadTagException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import javax.crypto.AEADBadTagException;
+
+import org.junit.Test;
 
 /**
  * V2 线格式对照测试。期望报文由独立实现（Node.js OpenSSL AES-128-GCM + HKDF）按

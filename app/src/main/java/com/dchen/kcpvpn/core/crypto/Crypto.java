@@ -2,10 +2,10 @@ package com.dchen.kcpvpn.core.crypto;
 
 import com.dchen.kcpvpn.log.Logger;
 
-import javax.crypto.AEADBadTagException;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
+import javax.crypto.AEADBadTagException;
 
 /**
  * 加密主类 - 与 C++ crypto.cpp 完全一致（V2 线格式）。
@@ -101,6 +101,9 @@ public class Crypto {
 
         this.encryptCipher = new AesGcmCipher(encryptKey);
         this.decryptCipher = new AesGcmCipher(decryptKey);
+        // 尽力清零：SecretKeySpec 构造时会复制密钥数组，Cipher 内部还有密钥调度，
+        // 这两个 fill 清不掉那些副本——Java 里无法真正擦除密钥。价值是缩短明文
+        // 密钥数组在堆上的存活窗口，不要把它当安全边界。
         Arrays.fill(encryptKey, (byte) 0);
         Arrays.fill(decryptKey, (byte) 0);
         if (pendingPsk != null) {

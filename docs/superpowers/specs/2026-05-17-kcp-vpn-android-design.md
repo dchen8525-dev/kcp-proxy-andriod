@@ -200,7 +200,7 @@ Builder builder = new Builder()
 
 ```
 APP 发送数据 → VPN 接口捕获 → PacketRouter.readPacket()
-→ 解析目标地址 → SOCKS5 Request 封装 → 
+→ 解析目标地址 → SOCKS5 Request 封装 →
 KcpClientSession.sendData() → KCP 加密封装 → UDP 发送到服务端
 ```
 
@@ -208,7 +208,7 @@ KcpClientSession.sendData() → KCP 加密封装 → UDP 发送到服务端
 
 ```
 服务端 UDP 响应 → KcpClientSession 接收解密 → KCP 输出数据
-→ SOCKS5 Response / 数据 → PacketRouter.writePacket() → 
+→ SOCKS5 Response / 数据 → PacketRouter.writePacket() →
 VPN 接口返回给 APP
 ```
 
@@ -265,7 +265,7 @@ server/
 UDP 收到数据包 → 尝试解密认证 → 成功则创建 ServerSession
 → 否则丢弃（防止未认证攻击者占用资源）
 → Session 启动后等待 SOCKS5 Request
-→ 解析目标地址 → 建立 TCP 连接到目标 → 
+→ 解析目标地址 → 建立 TCP 连接到目标 →
 → 开始双向数据转发
 ```
 

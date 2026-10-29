@@ -5,6 +5,8 @@ plugins {
 android {
     namespace 'com.dchen.kcpvpn'
     compileSdk 34
+    // 显式固定 build-tools 版本：不写时 AGP 用自己的默认值，会随 AGP 升级漂移。
+    buildToolsVersion "34.0.0"
 
     defaultConfig {
         applicationId "com.dchen.kcpvpn"

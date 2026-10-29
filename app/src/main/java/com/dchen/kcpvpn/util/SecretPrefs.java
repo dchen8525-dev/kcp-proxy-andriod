@@ -10,7 +10,6 @@ import com.dchen.kcpvpn.log.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
-
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;

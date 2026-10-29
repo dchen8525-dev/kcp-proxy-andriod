@@ -7,9 +7,9 @@ import static org.junit.Assert.assertTrue;
 
 import com.dchen.kcpvpn.core.crypto.CryptoConfig;
 
-import org.junit.Test;
-
 import java.nio.charset.StandardCharsets;
+
+import org.junit.Test;
 
 /**
  * 控制消息编码/识别：magic || session_salt，必须长度与内容精确匹配，

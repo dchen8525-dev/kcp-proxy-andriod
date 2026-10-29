@@ -1,8 +1,10 @@
 package com.dchen.kcpvpn.vpn;
 
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
 import com.dchen.kcpvpn.core.protocol.KcpFrame;
-import org.junit.Before;
-import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -14,9 +16,8 @@ import java.util.Queue;
 import java.util.Random;
 import java.util.TreeMap;
 
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import org.junit.Before;
+import org.junit.Test;
 
 /**
  * 动态对抗测试：以"应用收到的字节流 == 服务器发送的字节流（严格有序、无重复、

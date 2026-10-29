@@ -181,6 +181,11 @@ public class Kcp {
         if (len == 0) {
             return -1;
         }
+        // 参数越界显式返回错误码，而不是让 System.arraycopy 抛
+        // ArrayIndexOutOfBoundsException 炸穿调用线程。用减法比较避免 offset+len 溢出。
+        if (data == null || offset < 0 || len < 0 || len > data.length - offset) {
+            return -2;
+        }
 
         // 计算分片数量。frg 在线上只有 1 字节，count-1 必须落进 [0,254]；
         // 旧写法用 rcv_wnd(512) 当上限，count ∈ [255,512] 的消息会以截断的
@@ -463,6 +468,13 @@ public class Kcp {
             rx_rttval += (Math.abs(delta) - rx_rttval) / 4;
         }
 
+        // ikcp.c 的 ikcp_update_ack 在 EWMA 之后有 rx_srtt < 1 的钳位：回环链路上
+        // rtt 采样为 0 时，缺了这一行 rx_srtt 恒为 0，后续每次 ACK 都重新走
+        // "首次采样"分支，srtt/rttval 的历史被反复清零，RTO 估计永远不收敛。
+        if (rx_srtt < 1) {
+            rx_srtt = 1;
+        }
+
         int rto = rx_srtt + Math.max(interval, rx_rttval * 4);
         // 上限必须是 IKCP_RTO_MAX(60000)，不是 6000：ikcp.c 用 _ibound_(rx_minrto, rto, IKCP_RTO_MAX)。
         // 6000 会让本端在高 RTT/丢包链路上比 C 对端激进约 10 倍地重传。
@@ -513,6 +525,28 @@ public class Kcp {
         // snd_buf 删除，那段数据永远不会重传 —— 静默丢字节。
         if (timeDiff(sn, rcv_nxt + rcv_wnd) >= 0) {
             return;  // 超出接收窗口：丢弃且不 ACK
+        }
+
+        // 零长度 PUSH（ikcp_send 产生不了，只能来自异常/恶意对端）必须特殊处理，
+        // 否则两条路都是死锁：
+        //  - 入队：peekSize()==0 被投递循环当成"没有数据"，该段永远无法消费，
+        //    接收队列涨满后会话无声挂死（段已被 ACK，重传救不回来）；
+        //  - 直接丢弃：留下序号空洞，其后所有数据卡在 rcv_buf 里。
+        // 正确语义是"按序时消费一个 0 字节消息"：sn==rcv_nxt 时 ACK 并推进
+        // rcv_nxt；超前时绝不 ACK 也不入队（ACK 会让对端停止重传该 sn，空洞
+        // 永远填不上）；sn<rcv_nxt 的重复段照常 ACK 让对端停发。
+        if (segLen == 0) {
+            int cmp = timeDiff(sn, rcv_nxt);
+            if (cmp == 0) {
+                ackList.add(sn, ts);
+                rcv_nxt++;
+                // rcv_nxt 推进可能解锁滞留在 rcv_buf 里的后续段（它们此前一直在
+                // 等这个被吞掉的 sn），与 insertRcvBuf 的尾部行为保持一致。
+                moveRcvData();
+            } else if (cmp < 0) {
+                ackList.add(sn, ts);
+            }
+            return;
         }
 
         ackList.add(sn, ts);
@@ -706,9 +740,13 @@ public class Kcp {
             }
 
             if (needSend) {
+                // ikcp.c 在这里只标记 state=(IUINT32)-1，不中止本次 flush。
+                // 旧写法直接 return：snd_buf 里更新的段停止重传、snd_queue 不再
+                // 搬运，且每个 tick 都在同一处提前退出。上层会话靠 isAlive() 探测
+                // 死链回收会话（与 C++ KcpSession 行为一致），但探测之前的排空
+                // 必须照常进行，否则状态在"死"与"活"之间的窗口里双向冻结。
                 if (seg.xmit >= dead_link) {
                     state = -1;  // 死链
-                    return;
                 }
 
                 seg.xmit++;
@@ -721,6 +759,11 @@ public class Kcp {
         }
 
         // 拥塞控制：超时重传时降低 ssthresh
+        // 注意：本实现与 ikcp.c 在拥塞控制上有已知偏差（lost 时 cwnd=ssthresh 而非
+        // 折叠为 1；cwnd 增长内联在发送循环里而非 ikcp_input 的 una 推进处）。当前
+        // 所有会话都以 nodelay(nc=1) 建立，flush() 完全绕过 cwnd，偏差不生效；
+        // 若将来把 NODELAY_NOCWND 改回 0，必须先按 ikcp.c 重写这两处，否则与
+        // C++ 对端的行为不对等。
         if (lost) {
             ssthresh = Math.max(cwnd / 2, IKCP_THRESH_MIN);
             cwnd = ssthresh;

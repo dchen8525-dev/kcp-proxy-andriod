@@ -114,8 +114,10 @@ public class CppRemoteTunnelManager {
         }
         Logger.info(LogConfig.MODULE_VPN, "CPP_REMOTE session created connectionId=" + connectionId);
         if (!session.start()) {
+            // start() 失败时内部已经 close("KCP_SESSION_FAILED")，close 回调会把
+            // 会话从映射摘除并通知 PacketRouter——这里再补一次 onClosed 会让
+            // PacketRouter 对同一连接处理两次关闭（向 TUN 写两个 FIN/RST）。
             sessions.remove(connectionId, session);
-            closeCallback.onClosed("KCP_SESSION_FAILED");
         }
     }
 

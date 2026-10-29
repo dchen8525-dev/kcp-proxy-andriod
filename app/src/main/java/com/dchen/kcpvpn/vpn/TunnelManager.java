@@ -3,8 +3,8 @@ package com.dchen.kcpvpn.vpn;
 import com.dchen.kcpvpn.core.crypto.Crypto;
 import com.dchen.kcpvpn.core.protocol.KcpFrame;
 import com.dchen.kcpvpn.core.session.KcpClientSession;
-import com.dchen.kcpvpn.core.session.SocketProtector;
 import com.dchen.kcpvpn.core.session.SessionConfig;
+import com.dchen.kcpvpn.core.session.SocketProtector;
 import com.dchen.kcpvpn.log.LogConfig;
 import com.dchen.kcpvpn.log.Logger;
 

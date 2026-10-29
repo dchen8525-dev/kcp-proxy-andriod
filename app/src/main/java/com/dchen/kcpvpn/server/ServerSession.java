@@ -33,6 +33,8 @@ public class ServerSession {
     private Consumer<KcpFrame> frameHandler;
 
     private Thread updateThread;
+    // "客户端发 FEC 帧"的告警每会话只打一次
+    private boolean fecFrameWarned;
 
     public ServerSession(InetSocketAddress clientAddr, Crypto crypto) {
         this.sessionId = clientAddr.getAddress().getHostAddress() + ":" + clientAddr.getPort();
@@ -97,6 +99,16 @@ public class ServerSession {
             ret = kcp.input(decryptedData);
         }
         if (ret < 0) {
+            // 与 C++ kcp_tunnel.cpp 同判：被拒报文解出来是 FEC 封帧 → 客户端
+            // FEC 配置与本端不匹配（配置问题，不是密钥损坏），每会话只告警一次。
+            if (!fecFrameWarned
+                    && com.dchen.kcpvpn.core.protocol.FecFraming.looksLikeFecFrame(
+                            decryptedData, decryptedData.length)) {
+                fecFrameWarned = true;
+                Logger.warning(LogConfig.MODULE_KCP_SERVER,
+                        "client is sending FEC-framed datagrams but local side has no FEC "
+                                + "(match the FEC DATA:PARITY setting on both ends): " + sessionId);
+            }
             Logger.warning(LogConfig.MODULE_KCP_SERVER, "ikcp_input rejected packet, ret=" + ret);
             return;
         }

@@ -1,0 +1,25 @@
+# 统一行尾：所有文本文件在仓库内一律 LF，检出也保持 LF（覆盖 autocrlf）。
+# 历史上不同工具写入了 CRLF/LF 混杂的工作区文件，本文件防止再次漂移。
+* text=auto
+*.java text eol=lf
+*.xml text eol=lf
+*.gradle text eol=lf
+*.properties text eol=lf
+*.pro text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.cfg text eol=lf
+*.sh text eol=lf
+gradlew text eol=lf
+
+# Windows 批处理必须 CRLF（LF-only 的 .bat 在标签跳转上有兼容性风险）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.jar binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.apk binary
+*.keystore binary

@@ -31,6 +31,28 @@ counter starts at the first 6 bytes of session_salt (big-endian)
   the salt changes (client reconnect on a reused ephemeral port) and rejects a new session whose salt
   already belongs to a live session, which would mean AES-GCM (key, nonce) reuse. A reconnect
   replacement is still allowed when the session cap is reached, because it frees the slot it takes.
+- Server-side replacement order mirrors the C++ 0.3.1 fix (e3eff1d): the candidate session must pass
+  authentication, salt-uniqueness, AND the salt tombstone before the live session is evicted, so a
+  stale handshake retransmit of an older tunnel (its salt is already tombstoned) is refused while
+  the live session survives. Pinned by `LocalKcpServerStaleHandshakeTest`.
+- Per-candidate `Crypto` isolation mirrors the C++ 0.3.2 fix (3133a1c): a first datagram that fails
+  authentication leaves its poisoned learn-salt state inside an instance that `createSession`
+  discards immediately; the class refuses re-derivation once the PSK is consumed.
+
+### FEC framing interop (kcp-proxy-cpp 0.3.0+)
+
+The C++ side can wrap each datagram in FEC framing (`FEC header(6) + length(2)` inserted at the
+start of the AEAD plaintext, types 0xf1..0xf3 at plaintext bytes 4..5). Framing is per-direction
+and auto-adapted per session: the C++ server keeps a session bare when the peer's first datagram is
+a bare KCP segment (cmd bytes 0x51..0x54 are disjoint from FEC types). Android never sends FEC
+frames, so interop needs no FEC support and the wire stays byte-compatible in both directions.
+What Android ports is the diagnostic (`FecFraming.looksLikeFecFrame`): a datagram that decrypts
+but is rejected by `kcp.input` and probes as an FEC frame is logged once per session with the
+C++-matching wording — that is a FEC configuration mismatch, not key corruption. The receive-side
+buffer sizing follows the same rule the C++ 0.3.2 fix (d5bfa44) established: one whole datagram at
+the largest legal peer `--mtu` must fit (`SessionConfig.UDP_WIRE_DATAGRAM_MAX = 9052`), because
+the kernel silently truncates datagrams that exceed the receive buffer and the AEAD tag then never
+verifies — the tunnel looks connected but carries nothing.
 
 Two framings sit on top of that envelope:
 

@@ -1,10 +1,10 @@
 package com.dchen.kcpvpn.vpn.cppremote;
 
-import org.junit.Test;
+import static org.junit.Assert.assertEquals;
 
 import java.net.InetAddress;
 
-import static org.junit.Assert.assertEquals;
+import org.junit.Test;
 
 /**
  * SOCKS5 CONNECT 请求的 ATYP 选择：4 字节 → 0x01，16 字节 → 0x04。

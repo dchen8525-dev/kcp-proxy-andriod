@@ -1,11 +1,11 @@
 package com.dchen.kcpvpn.server;
 
-import org.junit.Test;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import java.net.InetAddress;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import org.junit.Test;
 
 /**
  * SsrfGuard 与 C++ address.cpp is_restricted_target 的判定对齐测试，

@@ -1,9 +1,9 @@
 package com.dchen.kcpvpn.vpn;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
 import com.dchen.kcpvpn.core.protocol.KcpFrame;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -11,8 +11,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
 
 /**
  * server→app 方向的在途段重传：TUN 写丢失的段由应用的 dup-ACK 敦促快速重传；
